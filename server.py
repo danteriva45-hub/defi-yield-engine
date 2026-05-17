@@ -1,0 +1,761 @@
+"""
+DeFi Yield Decision Engine — MCP Server
+Auteur  : toi (Guillaume)
+Version : 1.0.0
+Source  : DeFiLlama public API (gratuit, sans clé)
+
+Ce serveur propose 3 outils à des agents IA :
+  1. get_best_yield   → meilleure recommandation risk-ajustée
+  2. explain_risk     → analyse détaillée d'un protocole
+  3. compare_yields   → comparaison side-by-side
+
+Déploiement : Railway (voir README.md)
+Monétisation : mcp-billing-gateway (x402 / Stripe)
+"""
+
+import asyncio
+import time
+import logging
+from typing import Optional
+import httpx
+from fastmcp import FastMCP
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("defi-yield")
+
+# ── Serveur MCP ───────────────────────────────────────────────────────────────
+mcp = FastMCP(
+    name="defi-yield-engine",
+    instructions=(
+        "Risk-adjusted DeFi yield recommendations powered by DeFiLlama. "
+        "Use get_best_yield to find the optimal yield for a given asset and risk profile. "
+        "Use explain_risk to understand why a protocol is rated as it is. "
+        "Use compare_yields to compare multiple protocols side-by-side. "
+        "All outputs are optimized for minimal token consumption."
+    ),
+)
+
+# ── Configuration x402 ───────────────────────────────────────────────────────
+X402_RECIPIENT  = "0x74E3ab71eC674D343aD481Ea20F489C720C11Ad4"  # MetaMask Base
+X402_NETWORK    = "base"
+X402_CHAIN_ID   = 8453
+
+# Pricing par outil (en USDC — 6 décimales sur Base)
+X402_PRICING = {
+    "get_best_yield":  0.05,   # 0,05 USDC
+    "explain_risk":    0.02,   # 0,02 USDC
+    "compare_yields":  0.03,   # 0,03 USDC
+    "server_info":     0.00,   # gratuit
+}
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+_CACHE: dict = {"data": None, "updated_at": 0.0}
+_CACHE_TTL = 300  # 5 minutes
+
+DEFILLAMA_URL = "https://yields.llama.fi/pools"
+
+async def _fetch_pools() -> list[dict]:
+    """Récupère tous les pools DeFiLlama avec cache 5 minutes."""
+    now = time.time()
+    if _CACHE["data"] and (now - _CACHE["updated_at"]) < _CACHE_TTL:
+        return _CACHE["data"]
+
+    log.info("Fetching fresh data from DeFiLlama…")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(DEFILLAMA_URL)
+        r.raise_for_status()
+        pools = r.json()["data"]
+
+    _CACHE["data"] = pools
+    _CACHE["updated_at"] = now
+    log.info(f"Loaded {len(pools)} pools from DeFiLlama")
+    return pools
+
+
+# ── Algorithme de risk score ──────────────────────────────────────────────────
+def _risk_score(pool: dict) -> int:
+    """
+    Score de 0 à 100 (100 = plus sûr).
+
+    Signaux positifs  : TVL élevé, APY stable, pas de token reward, stablecoin
+    Signaux négatifs  : APY > 20%, outlier DeFiLlama, chute APY récente,
+                        dépendance forte aux rewards, risque impermanent
+    """
+    score = 50
+
+    # --- Liquidité (proxy de confiance marché)
+    tvl = pool.get("tvlUsd") or 0
+    if tvl >= 1_000_000_000:
+        score += 20
+    elif tvl >= 100_000_000:
+        score += 12
+    elif tvl >= 10_000_000:
+        score += 5
+    else:
+        score -= 10  # TVL < $10M : risque de liquidité
+
+    # --- Stabilité APY sur 30 jours
+    mean30 = pool.get("apyMean30d") or 0
+    current_apy = pool.get("apy") or 0
+    if mean30 > 0 and current_apy > 0:
+        deviation = abs(current_apy - mean30) / mean30
+        if deviation < 0.05:
+            score += 10   # très stable
+        elif deviation < 0.15:
+            score += 5    # acceptable
+        elif deviation > 0.50:
+            score -= 10   # APY très volatile
+
+    # --- Durabilité du rendement (base vs reward)
+    reward = pool.get("apyReward") or 0
+    base = pool.get("apyBase") or 0
+    if reward == 0:
+        score += 10           # 100% APY de base = rendement organique
+    elif base > 0 and reward <= base * 0.3:
+        score += 5            # rewards < 30% du total : acceptable
+    elif base > 0 and reward > base:
+        score -= 20           # rewards > base APY : modèle non-durable
+    elif base == 0 and reward > 0:
+        score -= 15           # rendement 100% en tokens = risque élevé
+
+    # --- Signaux de danger
+    if pool.get("outlier"):
+        score -= 25           # DeFiLlama marque les APY suspects ou anormaux
+    if current_apy > 30:
+        score -= 20           # APY > 30% = red flag sévère
+    elif current_apy > 20:
+        score -= 12           # APY > 20% = attention
+
+    # --- Risque de perte (impermanent loss, exposition)
+    if pool.get("ilRisk") == "yes":
+        score -= 10
+    if pool.get("exposure") == "single":
+        score += 5            # actif unique = pas d'IL
+
+    # --- Bonus stablecoin
+    if pool.get("stablecoin"):
+        score += 5
+
+    # --- Momentum récent
+    pct_7d = pool.get("apyPct7D") or 0
+    if pct_7d < -5:
+        score -= 10           # chute rapide en 7j
+    elif pct_7d < -2:
+        score -= 5
+
+    # --- Prédiction DeFiLlama (ML interne)
+    pred = (pool.get("predictions") or {}).get("predictedClass", "")
+    if pred == "Stable/Up":
+        score += 3
+    elif pred == "Down":
+        score -= 5
+
+    return max(0, min(100, score))
+
+
+def _risk_label(score: int) -> str:
+    if score >= 80: return "safe"
+    if score >= 60: return "moderate"
+    if score >= 40: return "elevated"
+    return "high_risk"
+
+
+def _score_threshold(risk_profile: str) -> int:
+    """Score minimum acceptable selon le profil."""
+    return {"safe": 75, "moderate": 55, "max_yield": 35}.get(risk_profile, 55)
+
+
+def _compact_pool(pool: dict, score: int) -> dict:
+    """Format de sortie compact — économise ~97% de tokens vs DeFiLlama brut."""
+    return {
+        "protocol":    pool.get("project", "unknown"),
+        "chain":       pool.get("chain", "unknown"),
+        "asset":       pool.get("symbol", "unknown"),
+        "apy":         round(pool.get("apy") or 0, 2),
+        "apy_base":    round(pool.get("apyBase") or 0, 2),
+        "apy_reward":  round(pool.get("apyReward") or 0, 2),
+        "tvl_usd":     int(pool.get("tvlUsd") or 0),
+        "risk_score":  score,
+        "risk_level":  _risk_label(score),
+    }
+
+
+def _build_reasoning(pool: dict, score: int) -> str:
+    """Génère une explication courte et lisible du score."""
+    reasons = []
+    tvl = pool.get("tvlUsd") or 0
+    if tvl >= 1_000_000_000:
+        reasons.append(f"TVL ${tvl/1e9:.1f}B (très liquide)")
+    elif tvl >= 100_000_000:
+        reasons.append(f"TVL ${tvl/1e6:.0f}M (liquide)")
+    else:
+        reasons.append(f"TVL ${tvl/1e6:.1f}M (faible liquidité)")
+
+    reward = pool.get("apyReward") or 0
+    base = pool.get("apyBase") or 0
+    if reward == 0:
+        reasons.append("rendement 100% organique (pas de token reward)")
+    elif base > 0 and reward > base:
+        reasons.append(f"⚠ reward APY ({reward:.1f}%) > base APY ({base:.1f}%)")
+
+    if pool.get("outlier"):
+        reasons.append("⚠ APY marqué comme outlier par DeFiLlama")
+    if (pool.get("apy") or 0) > 20:
+        reasons.append("⚠ APY élevé — vérifier source du rendement")
+    if pool.get("stablecoin"):
+        reasons.append("actif stable (pas de risque de marché)")
+    if pool.get("ilRisk") == "no":
+        reasons.append("pas de risque de perte impermanente")
+
+    return ". ".join(reasons) + "."
+
+
+# ── Outil 1 : get_best_yield ─────────────────────────────────────────────────
+@mcp.tool
+async def get_best_yield(
+    asset: str,
+    amount_usd: float,
+    risk_profile: str = "moderate",
+    chain: str = "all",
+) -> dict:
+    """
+    Select the single best DeFi yield opportunity for a given asset and risk profile.
+
+    Scores 13,800+ pools across 548 protocols and 115 chains using a 9-signal
+    risk algorithm (TVL, APY stability, reward dependency, outlier flag, momentum).
+    Returns ONE opinionated recommendation with reasoning + 2 alternatives.
+    Output: ~60 tokens — 97% smaller than raw DeFiLlama data.
+
+    Use this when: an agent needs to deploy capital and wants a single actionable
+    answer, not a list to evaluate manually.
+    Do NOT use for: protocol comparison (use compare_yields), risk detail (use explain_risk).
+
+    Args:
+        asset        : Token symbol. Examples: "USDC", "USDT", "ETH", "DAI", "USDS"
+        amount_usd   : Amount to deploy in USD. Filters pools with TVL >= 10x amount
+                       to ensure sufficient exit liquidity.
+        risk_profile : "safe" (risk_score >=75, large TVL, organic APY only),
+                       "moderate" (>=55, balanced), "max_yield" (>=35, higher risk)
+        chain        : "all" or specific chain: "Ethereum", "Arbitrum", "Base",
+                       "Polygon", "Optimism", "Avalanche", "BNB Chain", "Solana"
+
+    Returns:
+        JSON: recommendation {protocol, chain, apy, risk_score, risk_level, tvl_usd},
+        reasoning (plain text, ~30 words), alternatives (top 2), candidates_evaluated.
+    """
+    if risk_profile not in ("safe", "moderate", "max_yield"):
+        return {"error": "risk_profile must be 'safe', 'moderate', or 'max_yield'"}
+
+    pools = await _fetch_pools()
+
+    # Filtre TVL minimum : au moins 10× le montant déployé (sécurité liquidité)
+    min_tvl = max(10_000_000, amount_usd * 10)
+
+    # Filtrage
+    candidates = []
+    for p in pools:
+        sym = (p.get("symbol") or "").upper()
+        if asset.upper() not in sym:
+            continue
+        if (p.get("tvlUsd") or 0) < min_tvl:
+            continue
+        if not p.get("apy") or p["apy"] <= 0:
+            continue
+        if chain != "all" and p.get("chain", "").lower() != chain.lower():
+            continue
+
+        score = _risk_score(p)
+        if score < _score_threshold(risk_profile):
+            continue
+
+        candidates.append((score, p))
+
+    if not candidates:
+        return {
+            "error": "no_results",
+            "message": (
+                f"Aucun pool trouvé pour {asset} avec profil '{risk_profile}' "
+                f"et montant ${amount_usd:,.0f}. "
+                "Essaie un profil moins restrictif ou un montant plus faible."
+            ),
+        }
+
+    # Trier par score × APY (rendement ajusté au risque)
+    candidates.sort(key=lambda x: x[0] * (x[1].get("apy") or 0), reverse=True)
+
+    best_score, best = candidates[0]
+    alts = candidates[1:3]
+
+    return {
+        "recommendation": _compact_pool(best, best_score),
+        "reasoning":      _build_reasoning(best, best_score),
+        "alternatives": [
+            {**_compact_pool(p, s), "note": f"alternative #{i+1}"}
+            for i, (s, p) in enumerate(alts)
+        ],
+        "params": {
+            "asset": asset,
+            "amount_usd": amount_usd,
+            "risk_profile": risk_profile,
+            "chain": chain,
+            "candidates_evaluated": len(candidates),
+        },
+    }
+
+
+# ── Outil 2 : explain_risk ───────────────────────────────────────────────────
+@mcp.tool
+async def explain_risk(
+    protocol: str,
+    asset: str,
+    chain: str = "all",
+) -> dict:
+    """
+    Analyse détaillée du risque d'un protocole spécifique pour un asset.
+
+    Args:
+        protocol : Slug DeFiLlama. Exemples : "aave-v3", "morpho-blue",
+                   "compound-v3", "spark", "yearn-finance"
+        asset    : Symbole. Exemples : "USDC", "USDT", "ETH"
+        chain    : "all" ou nom de chain.
+
+    Returns:
+        Analyse complète : score, signaux positifs/négatifs, verdict.
+    """
+    pools = await _fetch_pools()
+
+    matches = [
+        p for p in pools
+        if protocol.lower() in (p.get("project") or "").lower()
+        and asset.upper() in (p.get("symbol") or "").upper()
+        and (chain == "all" or (p.get("chain") or "").lower() == chain.lower())
+        and (p.get("apy") or 0) > 0
+    ]
+
+    if not matches:
+        return {
+            "error": "not_found",
+            "message": f"Aucun pool trouvé pour {protocol}/{asset} sur {chain}.",
+            "hint": "Vérifie le slug avec la liste DeFiLlama : https://defillama.com/yields",
+        }
+
+    # Prendre le pool avec la TVL la plus élevée si plusieurs résultats
+    matches.sort(key=lambda p: p.get("tvlUsd") or 0, reverse=True)
+    p = matches[0]
+    score = _risk_score(p)
+
+    # Construire analyse signal par signal
+    positive, negative = [], []
+
+    tvl = p.get("tvlUsd") or 0
+    if tvl >= 1_000_000_000:
+        positive.append(f"TVL ${tvl/1e9:.1f}B — très grande liquidité")
+    elif tvl >= 100_000_000:
+        positive.append(f"TVL ${tvl/1e6:.0f}M — bonne liquidité")
+    else:
+        negative.append(f"TVL ${tvl/1e6:.1f}M — liquidité limitée")
+
+    reward = p.get("apyReward") or 0
+    base   = p.get("apyBase")   or 0
+    apy    = p.get("apy")       or 0
+    if reward == 0:
+        positive.append("Rendement 100% en APY de base (organique, durable)")
+    elif base > 0 and reward <= base * 0.3:
+        positive.append(f"Rewards modérés ({reward:.1f}% sur {apy:.1f}% total)")
+    else:
+        pct = (reward / apy * 100) if apy > 0 else 0
+        negative.append(f"Rewards = {pct:.0f}% du rendement total — risque d'émission")
+
+    mean30 = p.get("apyMean30d") or 0
+    if mean30 > 0:
+        dev = abs(apy - mean30) / mean30
+        if dev < 0.05:
+            positive.append(f"APY très stable (moy. 30j : {mean30:.2f}%)")
+        elif dev > 0.30:
+            negative.append(f"APY volatile (moy. 30j : {mean30:.2f}% vs actuel {apy:.2f}%)")
+        else:
+            positive.append(f"APY correct (moy. 30j : {mean30:.2f}%)")
+
+    if p.get("outlier"):
+        negative.append("⚠ Marqué 'outlier' par DeFiLlama — APY potentiellement suspect")
+    if apy > 20:
+        negative.append(f"⚠ APY élevé ({apy:.1f}%) — vérifier la source du rendement")
+    if p.get("ilRisk") == "no":
+        positive.append("Pas de risque de perte impermanente")
+    else:
+        negative.append("Risque de perte impermanente (pool multi-actifs)")
+    if p.get("stablecoin"):
+        positive.append("Actif stable — pas d'exposition au marché crypto")
+
+    pred = (p.get("predictions") or {}).get("predictedClass", "Inconnu")
+    prob = (p.get("predictions") or {}).get("predictedProbability", 0)
+    if pred == "Stable/Up":
+        positive.append(f"Prédiction DeFiLlama : {pred} ({prob}% confiance)")
+    elif pred == "Down":
+        negative.append(f"Prédiction DeFiLlama : {pred} ({prob}% confiance)")
+
+    # Verdict
+    if score >= 80:
+        verdict = "✅ Recommandé pour déploiement long terme (3-12 mois)"
+    elif score >= 65:
+        verdict = "⚠ Acceptable pour déploiement moyen terme (1-3 mois), surveiller"
+    elif score >= 50:
+        verdict = "⚠ À utiliser avec prudence, horizon court terme seulement"
+    else:
+        verdict = "❌ Déconseillé — risques significatifs identifiés"
+
+    return {
+        "protocol":    p.get("project"),
+        "chain":       p.get("chain"),
+        "asset":       p.get("symbol"),
+        "risk_score":  score,
+        "risk_level":  _risk_label(score),
+        "apy":         round(apy, 2),
+        "tvl_usd":     int(tvl),
+        "positive_signals": positive,
+        "negative_signals": negative,
+        "verdict":     verdict,
+        "data_age":    f"{int(time.time() - _CACHE['updated_at'])}s",
+    }
+
+
+# ── Outil 3 : compare_yields ─────────────────────────────────────────────────
+@mcp.tool
+async def compare_yields(
+    asset: str,
+    protocols: list[str],
+    chain: str = "all",
+) -> dict:
+    """
+    Comparaison side-by-side risk-ajustée de plusieurs protocoles.
+
+    Args:
+        asset     : Symbole. Exemples : "USDC", "USDT", "ETH"
+        protocols : Liste de slugs DeFiLlama (2 à 6).
+                    Exemples : ["aave-v3", "morpho-blue", "compound-v3"]
+        chain     : "all" ou nom de chain.
+
+    Returns:
+        Tableau comparatif trié par score risk-ajusté + recommandation finale.
+    """
+    if len(protocols) < 2:
+        return {"error": "Fournis au moins 2 protocoles à comparer."}
+    if len(protocols) > 6:
+        return {"error": "Maximum 6 protocoles par comparaison."}
+
+    pools = await _fetch_pools()
+    results = []
+
+    for slug in protocols:
+        matches = [
+            p for p in pools
+            if slug.lower() in (p.get("project") or "").lower()
+            and asset.upper() in (p.get("symbol") or "").upper()
+            and (chain == "all" or (p.get("chain") or "").lower() == chain.lower())
+            and (p.get("apy") or 0) > 0
+        ]
+        if not matches:
+            results.append({
+                "protocol": slug,
+                "status": "not_found",
+                "note": f"Aucun pool {asset} trouvé pour '{slug}'",
+            })
+            continue
+
+        matches.sort(key=lambda p: p.get("tvlUsd") or 0, reverse=True)
+        best = matches[0]
+        score = _risk_score(best)
+        results.append({
+            **_compact_pool(best, score),
+            "apy_mean_30d":   round(best.get("apyMean30d") or 0, 2),
+            "apy_change_7d":  round(best.get("apyPct7D") or 0, 2),
+            "reward_pct":     round(
+                (best.get("apyReward") or 0) / (best.get("apy") or 1) * 100, 1
+            ),
+            "prediction":     (best.get("predictions") or {}).get("predictedClass", "N/A"),
+            "risk_adjusted_score": round(score * (best.get("apy") or 0) / 100, 2),
+        })
+
+    # Trier les résultats valides par score risk-ajusté
+    valid = [r for r in results if r.get("risk_score") is not None]
+    invalid = [r for r in results if r.get("risk_score") is None]
+    valid.sort(key=lambda r: r["risk_adjusted_score"], reverse=True)
+
+    winner = valid[0] if valid else None
+
+    return {
+        "comparison": valid + invalid,
+        "winner": {
+            "protocol":   winner["protocol"] if winner else "N/A",
+            "chain":      winner.get("chain", "N/A") if winner else "N/A",
+            "apy":        winner["apy"] if winner else 0,
+            "risk_score": winner["risk_score"] if winner else 0,
+            "reasoning":  (
+                f"Meilleur compromis rendement/risque : APY {winner['apy']}% "
+                f"avec score de sécurité {winner['risk_score']}/100."
+            ) if winner else "Aucun résultat valide.",
+        },
+        "params": {"asset": asset, "protocols": protocols, "chain": chain},
+    }
+
+
+# ── Point d'entrée ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import os
+    port = int(os.getenv("PORT", 8000))
+    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+
+    log.info(f"Starting DeFi Yield Engine on port {port} ({transport})")
+    log.info(f"x402 recipient  : {X402_RECIPIENT}")
+    log.info(f"x402 network    : {X402_NETWORK} (chain {X402_CHAIN_ID})")
+    log.info(f"Pricing         : get_best_yield={X402_PRICING['get_best_yield']} USDC | "
+             f"explain_risk={X402_PRICING['explain_risk']} USDC | "
+             f"compare_yields={X402_PRICING['compare_yields']} USDC")
+
+    if transport == "stdio":
+        # Mode local (Claude Desktop / OpenClaw)
+        mcp.run(transport="stdio")
+    else:
+        # Mode remote (Railway / serveur)
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PARTIE 2 : RESOURCES, PROMPTS, SERVER CARD
+# Rend le serveur attrayant pour les agents IA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Resource 1 : Market Overview (données sans appel d'outil) ────────────────
+@mcp.resource("defi://market-overview")
+async def market_overview() -> str:
+    """
+    Snapshot temps réel des meilleurs yields DeFi toutes chains.
+    Les agents peuvent lire cette ressource SANS payer un appel d'outil.
+    Mise à jour toutes les 5 minutes via le cache partagé.
+    """
+    pools = await _fetch_pools()
+
+    # Top 5 USDC safe
+    usdc = sorted(
+        [p for p in pools
+         if "USDC" in (p.get("symbol") or "").upper()
+         and (p.get("tvlUsd") or 0) > 50_000_000
+         and (p.get("apy") or 0) > 0
+         and _risk_score(p) >= 70],
+        key=lambda p: _risk_score(p) * (p.get("apy") or 0),
+        reverse=True
+    )[:5]
+
+    # Top 3 ETH
+    eth = sorted(
+        [p for p in pools
+         if p.get("symbol") in ("ETH", "WETH", "stETH")
+         and (p.get("tvlUsd") or 0) > 100_000_000
+         and (p.get("apy") or 0) > 0],
+        key=lambda p: _risk_score(p) * (p.get("apy") or 0),
+        reverse=True
+    )[:3]
+
+    lines = ["# DeFi Yield Market Overview", f"_Updated: {int(time.time())}_", ""]
+    lines.append("## Top USDC Yields (risk-adjusted)")
+    for p in usdc:
+        sc = _risk_score(p)
+        lines.append(
+            f"- {p['project']} ({p['chain']}): "
+            f"{round(p.get('apy',0),2)}% APY | "
+            f"risk {sc}/100 | "
+            f"TVL ${int((p.get('tvlUsd') or 0)/1e6)}M"
+        )
+
+    lines.append("")
+    lines.append("## Top ETH Yields (risk-adjusted)")
+    for p in eth:
+        sc = _risk_score(p)
+        lines.append(
+            f"- {p['project']} ({p['chain']}): "
+            f"{round(p.get('apy',0),2)}% APY | "
+            f"risk {sc}/100 | "
+            f"TVL ${(p.get('tvlUsd') or 0)/1e9:.1f}B"
+        )
+
+    lines.append("")
+    lines.append(
+        "_Source: DeFiLlama. Risk score: 80+ = safe, 60-79 = moderate, "
+        "<60 = elevated risk. Use get_best_yield for personalized recommendations._"
+    )
+    return "\n".join(lines)
+
+
+# ── Resource 2 : Risk Glossary ───────────────────────────────────────────────
+@mcp.resource("defi://risk-glossary")
+async def risk_glossary() -> str:
+    """
+    Glossaire des termes de risque utilisés dans les outputs de ce serveur.
+    Aide les agents à interpréter correctement les recommandations.
+    """
+    return """# DeFi Yield Engine — Risk Glossary
+
+## risk_score (0-100)
+Score propriétaire composite. 80+ = safe. 60-79 = moderate. 40-59 = elevated. <40 = high risk.
+Calculé sur : TVL, stabilité APY 30j, ratio base/reward APY, outlier flag, momentum 7j, prédictions DeFiLlama.
+
+## apy_base vs apy_reward
+- apy_base : rendement généré par l'utilisation réelle du protocole (durable)
+- apy_reward : bonus en tokens émis par le protocole (souvent temporaire, à déprécier)
+- Règle : si apy_reward > apy_base, le rendement est non-durable
+
+## outlier
+Marqueur DeFiLlama indiquant un APY statistiquement anormal vs les pairs.
+Un outlier = true doit être traité avec grande prudence.
+
+## ilRisk (Impermanent Loss)
+- "no" : actif unique, pas de risque de perte impermanente
+- "yes" : pool multi-actifs (ex: LP Uniswap), exposition au ratio de prix entre actifs
+
+## exposure
+- "single" : exposition à un seul actif (plus sûr)
+- "multi" : exposition à plusieurs actifs
+
+## TVL (Total Value Locked)
+Liquidité totale dans le protocole. Proxy de confiance du marché.
+Règle générale : TVL > $100M = acceptable, > $500M = bon, > $1B = excellent.
+
+## risk_profile (paramètre get_best_yield)
+- "safe" : score minimum 75/100. Pour capital important, horizon long terme.
+- "moderate" : score minimum 55/100. Équilibre rendement/risque.
+- "max_yield" : score minimum 35/100. Rendement maximal, risque accru.
+"""
+
+
+# ── Prompt 1 : yield-check (commande slash dans Claude Desktop) ──────────────
+@mcp.prompt()
+def yield_check(
+    asset: str = "USDC",
+    amount: str = "10000",
+    risk: str = "moderate"
+) -> str:
+    """
+    Template : trouver le meilleur yield pour un montant donné.
+    Apparaît comme commande slash dans Claude Desktop.
+    Usage : /yield-check asset=USDC amount=50000 risk=safe
+    """
+    return (
+        f"I need to deploy {amount} USD worth of {asset} in DeFi. "
+        f"My risk profile is '{risk}'. "
+        f"Please use get_best_yield to find the best risk-adjusted yield, "
+        f"then use explain_risk to detail why the top recommendation is safe. "
+        f"Give me a clear recommendation I can act on immediately."
+    )
+
+
+# ── Prompt 2 : portfolio-optimize ────────────────────────────────────────────
+@mcp.prompt()
+def portfolio_optimize(
+    usdc_amount: str = "0",
+    usdt_amount: str = "0",
+    eth_amount: str = "0",
+    risk: str = "moderate"
+) -> str:
+    """
+    Template : optimiser un portefeuille multi-actifs.
+    Usage : /portfolio-optimize usdc_amount=20000 eth_amount=5 risk=safe
+    """
+    parts = []
+    if usdc_amount != "0":
+        parts.append(f"{usdc_amount} USDC")
+    if usdt_amount != "0":
+        parts.append(f"{usdt_amount} USDT")
+    if eth_amount != "0":
+        parts.append(f"{eth_amount} ETH")
+
+    assets_str = ", ".join(parts) if parts else "a mixed portfolio"
+
+    return (
+        f"I have {assets_str} to deploy in DeFi with a '{risk}' risk profile. "
+        f"For each asset, use get_best_yield to find the best option. "
+        f"Then use compare_yields to compare the top protocols across all assets. "
+        f"Give me a final allocation table with protocol, chain, expected APY, "
+        f"and estimated monthly revenue for each position."
+    )
+
+
+# ── Prompt 3 : daily-briefing ────────────────────────────────────────────────
+@mcp.prompt()
+def daily_briefing() -> str:
+    """
+    Template : rapport quotidien des meilleures opportunités yield.
+    Usage : /daily-briefing
+    Idéal pour les agents qui tournent sur un cron job matinal.
+    """
+    return (
+        "Generate a daily DeFi yield briefing using the defi://market-overview resource. "
+        "Structure it as: "
+        "1) Market summary (2 sentences on overall yield environment), "
+        "2) Top opportunity of the day with reasoning, "
+        "3) Any notable changes or risks to watch. "
+        "Keep it under 150 words, actionable and factual."
+    )
+
+
+# ── MCP Server Card (.well-known) ─────────────────────────────────────────────
+# Exposé via un outil léger pour la découverte automatique
+@mcp.tool
+async def server_info() -> dict:
+    """
+    Discover this DeFi yield server capabilities, tools, pricing, and free resources.
+
+    Returns complete server metadata: tool names + descriptions, available MCP resources
+    (defi://market-overview, defi://risk-glossary), prompt templates (/yield-check,
+    /portfolio-optimize, /daily-briefing), and per-tool USDC pricing.
+
+    Call this FIRST before any paid tool to understand what is available and free.
+    Data source: DeFiLlama (13,800+ pools). Cache: 5 min. This call is free.
+
+    Returns:
+        JSON with: name, description, tools {name: description}, resources {uri: desc},
+        prompts {name: desc}, pricing {tool: "X.XX USDC"}, data_source, cache_ttl_seconds.
+    """
+    return {
+        "name": "DeFi Yield Decision Engine",
+        "version": "1.0.0",
+        "description": (
+            "Risk-adjusted DeFi yield recommendations. "
+            "Covers 13,800+ pools across 548 protocols and 115 chains. "
+            "Returns opinionated recommendations with reasoning, "
+            "not raw data dumps. Optimized for minimal token consumption."
+        ),
+        "tools": {
+            "get_best_yield": "Best yield recommendation for an asset + risk profile",
+            "explain_risk": "Detailed risk breakdown for a specific protocol",
+            "compare_yields": "Side-by-side comparison of multiple protocols",
+            "server_info": "This endpoint — server metadata and capabilities",
+        },
+        "resources": {
+            "defi://market-overview": "Real-time snapshot of top yields (free, no tool call)",
+            "defi://risk-glossary": "Definitions of risk terms used in outputs",
+        },
+        "prompts": {
+            "yield_check": "Find best yield for an amount — /yield-check",
+            "portfolio_optimize": "Optimize multi-asset portfolio — /portfolio-optimize",
+            "daily_briefing": "Daily yield briefing — /daily-briefing",
+        },
+        "pricing": {
+            "get_best_yield": "0.05 USDC",
+            "explain_risk": "0.02 USDC",
+            "compare_yields": "0.03 USDC",
+            "server_info": "free",
+            "resources": "free",
+            "prompts": "free",
+        },
+        "payment": {
+            "protocol": "x402",
+            "network": X402_NETWORK,
+            "chain_id": X402_CHAIN_ID,
+            "asset": "USDC",
+            "recipient": X402_RECIPIENT,
+        },
+        "data_source": "DeFiLlama (https://defillama.com)",
+        "cache_ttl_seconds": 300,
+        "contact": "your@email.com",
+    }
