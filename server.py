@@ -19,6 +19,8 @@ import logging
 from typing import Optional
 import httpx
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -498,6 +500,52 @@ async def compare_yields(
         },
         "params": {"asset": asset, "protocols": protocols, "chain": chain},
     }
+
+
+# ── Manifest .well-known/x402.json (découverte Coinbase Bazaar) ─────────────
+@mcp.custom_route("/.well-known/x402.json", methods=["GET"])
+async def well_known_x402(request: Request) -> JSONResponse:
+    """
+    Manifest de découverte automatique pour le Coinbase x402 Bazaar.
+    Ce fichier est crawlé automatiquement — aucune inscription manuelle requise.
+    """
+    return JSONResponse({
+        "x402Version": "1",
+        "name": "DeFi Yield Decision Engine",
+        "description": (
+            "Risk-adjusted DeFi yield recommendations across 13,800+ pools. "
+            "Returns opinionated single recommendation with reasoning. "
+            "97% more token-efficient than raw DeFiLlama data."
+        ),
+        "version": "1.0.0",
+        "contact": "your@email.com",
+        "tags": ["defi", "yield", "finance", "risk", "USDC", "ETH", "DeFiLlama"],
+        "endpoints": [
+            {
+                "path": "/mcp",
+                "protocol": "mcp-streamable-http",
+                "tools": ["get_best_yield", "explain_risk", "compare_yields", "server_info"],
+                "resources": ["defi://market-overview", "defi://risk-glossary"],
+                "prompts":   ["yield_check", "portfolio_optimize", "daily_briefing"],
+            }
+        ],
+        "payment": {
+            "scheme":    "exact",
+            "network":   X402_NETWORK,
+            "chainId":   X402_CHAIN_ID,
+            "asset":     "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "payTo":     X402_RECIPIENT,
+            "pricing": {
+                "get_best_yield":  {"amount": "50000",  "decimals": 6},
+                "explain_risk":    {"amount": "20000",  "decimals": 6},
+                "compare_yields":  {"amount": "30000",  "decimals": 6},
+                "server_info":     {"amount": "0",      "decimals": 6},
+            },
+        },
+        "dataSource":      "DeFiLlama public API",
+        "cacheTtlSeconds": 300,
+        "mcpUrl":          "https://defi-yield-engine-production.up.railway.app/mcp",
+    })
 
 
 # ── Point d'entrée ────────────────────────────────────────────────────────────
