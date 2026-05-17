@@ -16,7 +16,7 @@ Monétisation : mcp-billing-gateway (x402 / Stripe)
 import asyncio
 import time
 import logging
-from typing import Optional
+from typing import Optional, Annotated
 import httpx
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -216,10 +216,10 @@ def _build_reasoning(pool: dict, score: int) -> str:
 # ── Outil 1 : get_best_yield ─────────────────────────────────────────────────
 @mcp.tool
 async def get_best_yield(
-    asset: str,
-    amount_usd: float,
-    risk_profile: str = "moderate",
-    chain: str = "all",
+    asset: Annotated[str, "Token symbol to find yield for. Examples: 'USDC', 'USDT', 'ETH', 'DAI', 'USDS'"],
+    amount_usd: Annotated[float, "Amount to deploy in USD. Minimum TVL filter = 10x this amount. Example: 50000"],
+    risk_profile: Annotated[str, "Risk tolerance: 'safe' (score>=75, large TVL), 'moderate' (>=55), 'max_yield' (>=35)"] = "moderate",
+    chain: Annotated[str, "Blockchain to filter by. 'all' or: 'Ethereum', 'Arbitrum', 'Base', 'Polygon', 'Optimism'"] = "all",
 ) -> dict:
     """
     Select the single best DeFi yield opportunity for a given asset and risk profile.
@@ -425,9 +425,9 @@ async def explain_risk(
 # ── Outil 3 : compare_yields ─────────────────────────────────────────────────
 @mcp.tool
 async def compare_yields(
-    asset: str,
-    protocols: list[str],
-    chain: str = "all",
+    asset: Annotated[str, "Token symbol to compare yields for. Examples: 'USDC', 'USDT', 'ETH'"],
+    protocols: Annotated[list[str], "List of 2-6 DeFiLlama project slugs. Examples: ['aave-v3', 'morpho-blue', 'compound-v3']"],
+    chain: Annotated[str, "Chain filter. 'all' or: 'Ethereum', 'Arbitrum', 'Base', 'Polygon', 'Optimism'"] = "all",
 ) -> dict:
     """
     Comparaison side-by-side risk-ajustée de plusieurs protocoles.
