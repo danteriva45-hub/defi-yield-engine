@@ -548,6 +548,204 @@ async def well_known_x402(request: Request) -> JSONResponse:
     })
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PARTIE 3 : YIELD ALERTS + A2A AGENT CARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Stockage alertes en mémoire
+_ALERTS: dict = {}
+
+
+@mcp.tool
+async def yield_alert_set(
+    asset: Annotated[str, "Token to monitor: 'USDC', 'USDT', 'ETH', 'DAI'"],
+    threshold_apy: Annotated[float, "Alert when best yield exceeds this APY. Example: 6.0"],
+    risk_profile: Annotated[str, "'safe', 'moderate', or 'max_yield'"] = "moderate",
+    chain: Annotated[str, "'all' or specific chain: 'Ethereum', 'Arbitrum', 'Base'"] = "all",
+) -> dict:
+    """Register an APY threshold alert. Returns alert_id to check later. FREE.
+
+    Fires when get_best_yield finds an opportunity exceeding threshold_apy.
+    Use yield_alert_check with alert_id to poll status.
+    Use yield_alert_delete to remove. Alerts persist in server memory.
+
+    Use this when: an agent wants to be notified when a yield opportunity opens
+    without continuously calling get_best_yield.
+
+    Args:
+        asset         : Token to monitor. Examples: 'USDC', 'USDT', 'ETH', 'DAI'
+        threshold_apy : Minimum APY to trigger. Example: 6.0 means alert when APY > 6%
+        risk_profile  : 'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)
+        chain         : 'all' or specific chain filter
+
+    Returns:
+        JSON with alert_id, current status (triggered/watching), current best APY.
+    """
+    import uuid
+    alert_id = str(uuid.uuid4())[:8]
+    current = await get_best_yield(asset, 1_000, risk_profile, chain)
+    current_apy = current.get("recommendation", {}).get("apy", 0) if "error" not in current else 0
+    already_triggered = current_apy >= threshold_apy
+
+    _ALERTS[alert_id] = {
+        "asset": asset, "threshold_apy": threshold_apy,
+        "risk_profile": risk_profile, "chain": chain,
+        "created_at": int(time.time()), "triggered": already_triggered,
+    }
+    log.info(f"Alert set: {alert_id} | {asset} > {threshold_apy}% | triggered={already_triggered}")
+
+    return {
+        "alert_id": alert_id,
+        "status": "triggered" if already_triggered else "watching",
+        "asset": asset, "threshold_apy": threshold_apy,
+        "current_best_apy": current_apy, "price": "free",
+        "message": (
+            f"TRIGGERED: {asset} yield {current_apy}% > {threshold_apy}%"
+            if already_triggered else
+            f"Watching {asset} > {threshold_apy}%. Poll: yield_alert_check('{alert_id}')"
+        ),
+    }
+
+
+@mcp.tool
+async def yield_alert_check(
+    alert_id: Annotated[str, "Alert ID from yield_alert_set. Example: 'a3f2b1c0'"],
+) -> dict:
+    """Poll a yield alert status. FREE. Safe to call frequently — uses cached data.
+
+    Returns current status (triggered/watching), current best APY vs threshold,
+    and full recommendation if triggered.
+
+    Args:
+        alert_id : ID returned by yield_alert_set
+
+    Returns:
+        JSON with status, current_best_apy, threshold, recommendation if triggered.
+    """
+    if alert_id not in _ALERTS:
+        return {"status": "not_found", "alert_id": alert_id,
+                "message": "Alert not found — may have expired on server restart."}
+
+    alert = _ALERTS[alert_id]
+    current = await get_best_yield(alert["asset"], 1_000, alert["risk_profile"], alert["chain"])
+    current_apy = current.get("recommendation", {}).get("apy", 0) if "error" not in current else 0
+    triggered = current_apy >= alert["threshold_apy"]
+    _ALERTS[alert_id]["triggered"] = triggered
+
+    result = {
+        "alert_id": alert_id, "status": "triggered" if triggered else "watching",
+        "asset": alert["asset"], "threshold_apy": alert["threshold_apy"],
+        "current_best_apy": current_apy, "risk_profile": alert["risk_profile"],
+        "age_seconds": int(time.time()) - alert["created_at"], "price": "free",
+    }
+    if triggered:
+        result["recommendation"] = current.get("recommendation", {})
+        result["reasoning"] = current.get("reasoning", "")
+        result["message"] = f"ALERT TRIGGERED: {alert['asset']} yield {current_apy}% exceeds {alert['threshold_apy']}%"
+    else:
+        result["message"] = f"Watching: best {alert['asset']} is {current_apy}% (threshold: {alert['threshold_apy']}%)"
+    return result
+
+
+@mcp.tool
+async def yield_alert_delete(
+    alert_id: Annotated[str, "Alert ID to remove. Example: 'a3f2b1c0'"],
+) -> dict:
+    """Delete a yield alert by ID. FREE.
+
+    Args:
+        alert_id : ID returned by yield_alert_set
+
+    Returns:
+        JSON confirming deletion or not_found.
+    """
+    if alert_id not in _ALERTS:
+        return {"status": "not_found", "alert_id": alert_id}
+    del _ALERTS[alert_id]
+    return {"status": "deleted", "alert_id": alert_id}
+
+
+@mcp.tool
+async def yield_alerts_list() -> dict:
+    """List all active yield alerts. Useful for agents managing multiple positions. FREE.
+
+    Returns:
+        JSON with all alerts, their status, and age in seconds.
+    """
+    if not _ALERTS:
+        return {"alerts": [], "count": 0}
+    return {
+        "alerts": [
+            {"alert_id": aid, "asset": a["asset"],
+             "threshold_apy": a["threshold_apy"], "risk_profile": a["risk_profile"],
+             "chain": a["chain"], "triggered": a["triggered"],
+             "age_seconds": int(time.time()) - a["created_at"]}
+            for aid, a in _ALERTS.items()
+        ],
+        "count": len(_ALERTS), "price": "free",
+    }
+
+
+@mcp.prompt()
+def yield_watch(
+    asset: str = "USDC",
+    target_apy: str = "6.0",
+    risk: str = "safe",
+) -> str:
+    """Monitor yield and act when threshold is reached.
+    Usage: /yield-watch asset=USDC target_apy=6.0 risk=safe
+    """
+    return (
+        f"Set a yield alert for {asset} with threshold {target_apy}% and risk profile '{risk}' "
+        f"using yield_alert_set. Check yield_alert_check every 5 minutes until triggered. "
+        f"When triggered, call get_best_yield to confirm and report protocol, chain, APY, "
+        f"risk_score, and recommended action."
+    )
+
+
+@mcp.custom_route("/.well-known/agent.json", methods=["GET"])
+async def agent_card_a2a(request: Request) -> JSONResponse:
+    """A2A Agent Card — Google Agent-to-Agent Protocol discovery standard.
+    Auto-crawled by A2A orchestrators (Salesforce, SAP, ServiceNow, Google ADK).
+    """
+    return JSONResponse({
+        "name": "DeFi Yield Decision Engine",
+        "description": (
+            "Risk-adjusted DeFi yield recommendations and APY threshold alerts "
+            "across 548 protocols and 115 chains. One answer, not 13,800 pools."
+        ),
+        "url": "https://defi-yield-engine-production.up.railway.app/mcp",
+        "version": "1.0.0",
+        "provider": {"name": "danteriva45", "organization": "Independent"},
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": False,
+        },
+        "authentication": {"schemes": ["x402"]},
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": [
+            {"id": "get_best_yield", "name": "Get Best DeFi Yield",
+             "description": "Single best risk-adjusted yield for USDC, USDT, ETH across 548 protocols.",
+             "tags": ["defi", "yield", "USDC", "ETH", "risk"], "price": "0.05 USDC"},
+            {"id": "explain_risk", "name": "Explain Protocol Risk",
+             "description": "Detailed risk signal breakdown for any DeFiLlama protocol.",
+             "tags": ["risk", "audit", "defi", "safety"], "price": "0.02 USDC"},
+            {"id": "compare_yields", "name": "Compare DeFi Protocols",
+             "description": "Side-by-side risk-adjusted comparison of 2-6 protocols.",
+             "tags": ["compare", "defi", "yield"], "price": "0.03 USDC"},
+            {"id": "yield_alert_set", "name": "Set Yield Alert",
+             "description": "Register APY threshold alert — fires when yield exceeds target.",
+             "tags": ["alert", "monitoring", "automation"], "price": "free"},
+            {"id": "yield_alert_check", "name": "Check Yield Alert",
+             "description": "Poll alert status — triggered/watching + current best APY.",
+             "tags": ["alert", "polling"], "price": "free"},
+        ],
+    })
+
 # ── Point d'entrée ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import os
@@ -774,10 +972,14 @@ async def server_info() -> dict:
             "not raw data dumps. Optimized for minimal token consumption."
         ),
         "tools": {
-            "get_best_yield": "Best yield recommendation for an asset + risk profile",
-            "explain_risk": "Detailed risk breakdown for a specific protocol",
-            "compare_yields": "Side-by-side comparison of multiple protocols",
-            "server_info": "This endpoint — server metadata and capabilities",
+            "get_best_yield":     "Best yield recommendation for asset + risk profile — 0.05 USDC",
+            "explain_risk":       "Detailed risk breakdown for a specific protocol — 0.02 USDC",
+            "compare_yields":     "Side-by-side comparison of multiple protocols — 0.03 USDC",
+            "yield_alert_set":    "Register APY threshold alert — FREE",
+            "yield_alert_check":  "Poll alert status — FREE",
+            "yield_alert_delete": "Remove an alert — FREE",
+            "yield_alerts_list":  "List all active alerts — FREE",
+            "server_info":        "Server metadata and capabilities — FREE",
         },
         "resources": {
             "defi://market-overview": "Real-time snapshot of top yields (free, no tool call)",
@@ -807,3 +1009,200 @@ async def server_info() -> dict:
         "cache_ttl_seconds": 300,
         "contact": "your@email.com",
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PARTIE 3 : YIELD ALERTS + A2A AGENT CARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Stockage alertes en mémoire
+_ALERTS: dict = {}
+
+
+@mcp.tool
+async def yield_alert_set(
+    asset: Annotated[str, "Token to monitor: 'USDC', 'USDT', 'ETH', 'DAI'"],
+    threshold_apy: Annotated[float, "Alert when best yield exceeds this APY. Example: 6.0"],
+    risk_profile: Annotated[str, "'safe', 'moderate', or 'max_yield'"] = "moderate",
+    chain: Annotated[str, "'all' or specific chain: 'Ethereum', 'Arbitrum', 'Base'"] = "all",
+) -> dict:
+    """Register an APY threshold alert. Returns alert_id to check later. FREE.
+
+    Fires when get_best_yield finds an opportunity exceeding threshold_apy.
+    Use yield_alert_check with alert_id to poll status.
+    Use yield_alert_delete to remove. Alerts persist in server memory.
+
+    Use this when: an agent wants to be notified when a yield opportunity opens
+    without continuously calling get_best_yield.
+
+    Args:
+        asset         : Token to monitor. Examples: 'USDC', 'USDT', 'ETH', 'DAI'
+        threshold_apy : Minimum APY to trigger. Example: 6.0 means alert when APY > 6%
+        risk_profile  : 'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)
+        chain         : 'all' or specific chain filter
+
+    Returns:
+        JSON with alert_id, current status (triggered/watching), current best APY.
+    """
+    import uuid
+    alert_id = str(uuid.uuid4())[:8]
+    current = await get_best_yield(asset, 1_000, risk_profile, chain)
+    current_apy = current.get("recommendation", {}).get("apy", 0) if "error" not in current else 0
+    already_triggered = current_apy >= threshold_apy
+
+    _ALERTS[alert_id] = {
+        "asset": asset, "threshold_apy": threshold_apy,
+        "risk_profile": risk_profile, "chain": chain,
+        "created_at": int(time.time()), "triggered": already_triggered,
+    }
+    log.info(f"Alert set: {alert_id} | {asset} > {threshold_apy}% | triggered={already_triggered}")
+
+    return {
+        "alert_id": alert_id,
+        "status": "triggered" if already_triggered else "watching",
+        "asset": asset, "threshold_apy": threshold_apy,
+        "current_best_apy": current_apy, "price": "free",
+        "message": (
+            f"TRIGGERED: {asset} yield {current_apy}% > {threshold_apy}%"
+            if already_triggered else
+            f"Watching {asset} > {threshold_apy}%. Poll: yield_alert_check('{alert_id}')"
+        ),
+    }
+
+
+@mcp.tool
+async def yield_alert_check(
+    alert_id: Annotated[str, "Alert ID from yield_alert_set. Example: 'a3f2b1c0'"],
+) -> dict:
+    """Poll a yield alert status. FREE. Safe to call frequently — uses cached data.
+
+    Returns current status (triggered/watching), current best APY vs threshold,
+    and full recommendation if triggered.
+
+    Args:
+        alert_id : ID returned by yield_alert_set
+
+    Returns:
+        JSON with status, current_best_apy, threshold, recommendation if triggered.
+    """
+    if alert_id not in _ALERTS:
+        return {"status": "not_found", "alert_id": alert_id,
+                "message": "Alert not found — may have expired on server restart."}
+
+    alert = _ALERTS[alert_id]
+    current = await get_best_yield(alert["asset"], 1_000, alert["risk_profile"], alert["chain"])
+    current_apy = current.get("recommendation", {}).get("apy", 0) if "error" not in current else 0
+    triggered = current_apy >= alert["threshold_apy"]
+    _ALERTS[alert_id]["triggered"] = triggered
+
+    result = {
+        "alert_id": alert_id, "status": "triggered" if triggered else "watching",
+        "asset": alert["asset"], "threshold_apy": alert["threshold_apy"],
+        "current_best_apy": current_apy, "risk_profile": alert["risk_profile"],
+        "age_seconds": int(time.time()) - alert["created_at"], "price": "free",
+    }
+    if triggered:
+        result["recommendation"] = current.get("recommendation", {})
+        result["reasoning"] = current.get("reasoning", "")
+        result["message"] = f"ALERT TRIGGERED: {alert['asset']} yield {current_apy}% exceeds {alert['threshold_apy']}%"
+    else:
+        result["message"] = f"Watching: best {alert['asset']} is {current_apy}% (threshold: {alert['threshold_apy']}%)"
+    return result
+
+
+@mcp.tool
+async def yield_alert_delete(
+    alert_id: Annotated[str, "Alert ID to remove. Example: 'a3f2b1c0'"],
+) -> dict:
+    """Delete a yield alert by ID. FREE.
+
+    Args:
+        alert_id : ID returned by yield_alert_set
+
+    Returns:
+        JSON confirming deletion or not_found.
+    """
+    if alert_id not in _ALERTS:
+        return {"status": "not_found", "alert_id": alert_id}
+    del _ALERTS[alert_id]
+    return {"status": "deleted", "alert_id": alert_id}
+
+
+@mcp.tool
+async def yield_alerts_list() -> dict:
+    """List all active yield alerts. Useful for agents managing multiple positions. FREE.
+
+    Returns:
+        JSON with all alerts, their status, and age in seconds.
+    """
+    if not _ALERTS:
+        return {"alerts": [], "count": 0}
+    return {
+        "alerts": [
+            {"alert_id": aid, "asset": a["asset"],
+             "threshold_apy": a["threshold_apy"], "risk_profile": a["risk_profile"],
+             "chain": a["chain"], "triggered": a["triggered"],
+             "age_seconds": int(time.time()) - a["created_at"]}
+            for aid, a in _ALERTS.items()
+        ],
+        "count": len(_ALERTS), "price": "free",
+    }
+
+
+@mcp.prompt()
+def yield_watch(
+    asset: str = "USDC",
+    target_apy: str = "6.0",
+    risk: str = "safe",
+) -> str:
+    """Monitor yield and act when threshold is reached.
+    Usage: /yield-watch asset=USDC target_apy=6.0 risk=safe
+    """
+    return (
+        f"Set a yield alert for {asset} with threshold {target_apy}% and risk profile '{risk}' "
+        f"using yield_alert_set. Check yield_alert_check every 5 minutes until triggered. "
+        f"When triggered, call get_best_yield to confirm and report protocol, chain, APY, "
+        f"risk_score, and recommended action."
+    )
+
+
+@mcp.custom_route("/.well-known/agent.json", methods=["GET"])
+async def agent_card_a2a(request: Request) -> JSONResponse:
+    """A2A Agent Card — Google Agent-to-Agent Protocol discovery standard.
+    Auto-crawled by A2A orchestrators (Salesforce, SAP, ServiceNow, Google ADK).
+    """
+    return JSONResponse({
+        "name": "DeFi Yield Decision Engine",
+        "description": (
+            "Risk-adjusted DeFi yield recommendations and APY threshold alerts "
+            "across 548 protocols and 115 chains. One answer, not 13,800 pools."
+        ),
+        "url": "https://defi-yield-engine-production.up.railway.app/mcp",
+        "version": "1.0.0",
+        "provider": {"name": "danteriva45", "organization": "Independent"},
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": False,
+        },
+        "authentication": {"schemes": ["x402"]},
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": [
+            {"id": "get_best_yield", "name": "Get Best DeFi Yield",
+             "description": "Single best risk-adjusted yield for USDC, USDT, ETH across 548 protocols.",
+             "tags": ["defi", "yield", "USDC", "ETH", "risk"], "price": "0.05 USDC"},
+            {"id": "explain_risk", "name": "Explain Protocol Risk",
+             "description": "Detailed risk signal breakdown for any DeFiLlama protocol.",
+             "tags": ["risk", "audit", "defi", "safety"], "price": "0.02 USDC"},
+            {"id": "compare_yields", "name": "Compare DeFi Protocols",
+             "description": "Side-by-side risk-adjusted comparison of 2-6 protocols.",
+             "tags": ["compare", "defi", "yield"], "price": "0.03 USDC"},
+            {"id": "yield_alert_set", "name": "Set Yield Alert",
+             "description": "Register APY threshold alert — fires when yield exceeds target.",
+             "tags": ["alert", "monitoring", "automation"], "price": "free"},
+            {"id": "yield_alert_check", "name": "Check Yield Alert",
+             "description": "Poll alert status — triggered/watching + current best APY.",
+             "tags": ["alert", "polling"], "price": "free"},
+        ],
+    })
