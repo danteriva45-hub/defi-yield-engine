@@ -1,1 +1,1 @@
-smithery-verification=6792ebd023b2afc0ac3fea89c028f9aa3e3980678dd45a1a203832feef1bb1b5
+[![smithery badge](https://smithery.ai/badge/danteriva45/defi-yield-engine)](https://smithery.ai/servers/danteriva45/defi-yield-engine)
