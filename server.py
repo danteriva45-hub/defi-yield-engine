@@ -1128,6 +1128,525 @@ async def agent_card_a2a(request: Request) -> JSONResponse:
     })
 
 # ── Setup x402 Payment Middleware ────────────────────────────────────────────
+# PARTIE 5 : BATCH 1 — PERPS / LIQUID STAKING / RESTAKING / RWA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Caches supplémentaires ────────────────────────────────────────────────────
+_PROTOCOLS_CACHE: dict = {"data": None, "updated_at": 0.0}
+_PERPS_CACHE:     dict = {"data": None, "updated_at": 0.0}
+_PROTOCOLS_TTL = 300   # 5 min
+_PERPS_TTL     = 180   # 3 min (volumes changent vite)
+
+
+async def _fetch_all_protocols() -> list[dict]:
+    """Récupère tous les protocoles DeFiLlama avec cache 5 min."""
+    now = time.time()
+    if _PROTOCOLS_CACHE["data"] and (now - _PROTOCOLS_CACHE["updated_at"]) < _PROTOCOLS_TTL:
+        return _PROTOCOLS_CACHE["data"]
+    log.info("Fetching protocols from DeFiLlama…")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get("https://api.llama.fi/protocols")
+        r.raise_for_status()
+        data = r.json()
+    _PROTOCOLS_CACHE["data"]       = data
+    _PROTOCOLS_CACHE["updated_at"] = now
+    log.info(f"Loaded {len(data)} protocols")
+    return data
+
+
+async def _fetch_protocols_by_category(category: str) -> list[dict]:
+    """Filtre les protocoles par catégorie DeFiLlama (case-insensitive)."""
+    all_p = await _fetch_all_protocols()
+    return [p for p in all_p
+            if (p.get("category") or "").lower() == category.lower()]
+
+
+async def _fetch_perps() -> list[dict]:
+    """Récupère les données perpetuals/derivatives DeFiLlama."""
+    now = time.time()
+    if _PERPS_CACHE["data"] and (now - _PERPS_CACHE["updated_at"]) < _PERPS_TTL:
+        return _PERPS_CACHE["data"]
+    log.info("Fetching perps data from DeFiLlama…")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get("https://api.llama.fi/overview/derivatives")
+        r.raise_for_status()
+        data = r.json()
+    protocols = data.get("protocols", []) if isinstance(data, dict) else data
+    _PERPS_CACHE["data"]       = protocols
+    _PERPS_CACHE["updated_at"] = now
+    log.info(f"Loaded {len(protocols)} perps protocols")
+    return protocols
+
+
+# ── Risk score pour protocoles (TVL + ancienneté + audits) ───────────────────
+def _protocol_risk_score(p: dict) -> int:
+    """
+    Score 0-100 pour protocoles staking/RWA basé sur TVL, audits, ancienneté.
+    Différent du _risk_score() pool qui utilise APY + outlier.
+    """
+    score = 50
+    tvl = p.get("tvl") or 0
+
+    # TVL — proxy confiance marché
+    if tvl >= 5_000_000_000:  score += 25
+    elif tvl >= 1_000_000_000: score += 20
+    elif tvl >= 100_000_000:   score += 12
+    elif tvl >= 10_000_000:    score += 5
+    else:                      score -= 15
+
+    # Audits
+    audits = p.get("audits") or "0"
+    try:
+        if int(audits) >= 2: score += 8
+        elif int(audits) == 1: score += 4
+    except (ValueError, TypeError):
+        pass
+
+    # Ancienneté (listedAt en timestamp Unix)
+    listed = p.get("listedAt") or 0
+    age_days = (time.time() - listed) / 86400 if listed else 0
+    if age_days >= 730:  score += 10   # > 2 ans
+    elif age_days >= 365: score += 7   # > 1 an
+    elif age_days >= 180: score += 3
+
+    # Momentum TVL 7j
+    change7d = p.get("change_7d") or 0
+    try:
+        c = float(change7d)
+        if c > 5:    score += 3
+        elif c < -15: score -= 8
+    except (ValueError, TypeError):
+        pass
+
+    return max(0, min(100, score))
+
+
+def _compact_protocol(p: dict, score: int) -> dict:
+    """Output compact pour protocoles (staking, RWA…)."""
+    return {
+        "protocol":    p.get("slug") or p.get("name", "unknown"),
+        "name":        p.get("name", "unknown"),
+        "category":    p.get("category", "unknown"),
+        "chains":      (p.get("chains") or [])[:4],
+        "tvl_usd":     int(p.get("tvl") or 0),
+        "change_7d":   round(float(p.get("change_7d") or 0), 1),
+        "risk_score":  score,
+        "risk_level":  _risk_label(score),
+        "url":         p.get("url") or f"https://defillama.com/protocol/{p.get('slug','')}",
+    }
+
+
+# ── Outil : get_best_liquid_staking ──────────────────────────────────────────
+@mcp.tool
+async def get_best_liquid_staking(
+    asset: Annotated[str, "Asset to stake. Examples: 'ETH', 'SOL', 'BNB', 'MATIC'"] = "ETH",
+    risk_profile: Annotated[str, "'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)"] = "moderate",
+    chain: Annotated[str, "'all' or chain name: 'Ethereum', 'Solana', 'BNB Chain'"] = "all",
+) -> dict:
+    """Select the best liquid staking protocol for a given asset and risk profile.
+
+    Scores protocols by TVL, audit count, age, and momentum. Returns one
+    recommendation with reasoning and top alternatives.
+    Covers: Lido, Rocket Pool, Coinbase cbETH, Jito, Marinade, and 50+ others.
+
+    Use this when: an agent needs to stake an asset while keeping it liquid.
+    Do NOT use for: yield farming (use get_best_yield), restaking (use get_best_restaking).
+
+    Args:
+        asset        : Asset to stake. Examples: 'ETH', 'SOL', 'BNB'
+        risk_profile : 'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)
+        chain        : 'all' or specific chain
+
+    Returns:
+        JSON with recommendation {protocol, name, tvl_usd, risk_score, chains},
+        reasoning, alternatives (top 2). Price: 0.05 USDC
+    """
+    protocols = await _fetch_protocols_by_category("Liquid Staking")
+
+    # Filtre par chain et asset (dans le nom ou symbol)
+    candidates = []
+    for p in protocols:
+        if chain != "all":
+            chains = [c.lower() for c in (p.get("chains") or [])]
+            if chain.lower() not in chains:
+                continue
+        # Filtre asset par symbol/name (heuristique)
+        if asset.upper() not in ["ALL", "ANY"]:
+            name_sym = f"{p.get('name','')} {p.get('symbol','')}".upper()
+            if asset.upper() not in name_sym and asset.upper() not in [
+                c.upper() for c in (p.get("chains") or [])
+            ]:
+                # Cas spéciaux : ETH → accepter tout sur Ethereum
+                if asset.upper() == "ETH" and "Ethereum" not in (p.get("chains") or []):
+                    continue
+                # SOL → accepter tout sur Solana
+                elif asset.upper() == "SOL" and "Solana" not in (p.get("chains") or []):
+                    continue
+                elif asset.upper() not in ("ETH", "SOL"):
+                    continue
+
+        if (p.get("tvl") or 0) < 1_000_000:
+            continue
+
+        score = _protocol_risk_score(p)
+        if score < _score_threshold(risk_profile):
+            continue
+        candidates.append((score, p))
+
+    if not candidates:
+        # Fallback : retourner les meilleurs sans filtre asset
+        all_ls = await _fetch_protocols_by_category("Liquid Staking")
+        candidates = [(s := _protocol_risk_score(p), p)
+                      for p in all_ls if (p.get("tvl") or 0) > 10_000_000
+                      and s >= _score_threshold(risk_profile)][:10]
+
+    if not candidates:
+        return {
+            "error":   "no_results",
+            "message": f"No liquid staking protocols found for {asset} with profile '{risk_profile}'.",
+        }
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best = candidates[0]
+    alts = candidates[1:3]
+
+    reasoning_parts = [
+        f"TVL ${int(best.get('tvl') or 0)/1e9:.1f}B." if (best.get("tvl") or 0) >= 1e9
+        else f"TVL ${int(best.get('tvl') or 0)/1e6:.0f}M.",
+        f"Active on {len(best.get('chains') or [])} chains.",
+    ]
+    age_days = (time.time() - (best.get("listedAt") or 0)) / 86400
+    if age_days > 365:
+        reasoning_parts.append(f"Protocol age {int(age_days/365)}y+ — established.")
+    try:
+        if int(best.get("audits") or 0) >= 1:
+            reasoning_parts.append("Audited.")
+    except (ValueError, TypeError):
+        pass
+
+    return {
+        "recommendation": _compact_protocol(best, best_score),
+        "reasoning":      " ".join(reasoning_parts),
+        "alternatives":   [_compact_protocol(p, s) for s, p in alts],
+        "asset":          asset,
+        "risk_profile":   risk_profile,
+        "price":          "0.05 USDC",
+    }
+
+
+# ── Outil : get_best_restaking ────────────────────────────────────────────────
+@mcp.tool
+async def get_best_restaking(
+    risk_profile: Annotated[str, "'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)"] = "moderate",
+    restaking_type: Annotated[str, "'restaking' (base layer: EigenLayer, Symbiotic) or 'liquid-restaking' (LRT tokens: EtherFi, Renzo, Puffer)"] = "liquid-restaking",
+) -> dict:
+    """Select the best restaking protocol by TVL and risk profile.
+
+    Covers base restaking (EigenLayer, Symbiotic, Karak) and liquid restaking
+    tokens (EtherFi, Renzo, Puffer, Kelp). Scored by TVL, audits, and age.
+
+    Use this when: an agent wants to restake ETH or LSTs for additional yield.
+    Do NOT use for: simple staking (use get_best_liquid_staking).
+
+    Args:
+        risk_profile    : 'safe', 'moderate', or 'max_yield'
+        restaking_type  : 'restaking' or 'liquid-restaking'
+
+    Returns:
+        JSON with recommendation, reasoning, alternatives. Price: 0.05 USDC
+    """
+    category = "Liquid Restaking" if restaking_type == "liquid-restaking" else "Restaking"
+    protocols = await _fetch_protocols_by_category(category)
+
+    candidates = [
+        (_protocol_risk_score(p), p) for p in protocols
+        if (p.get("tvl") or 0) >= 1_000_000
+        and _protocol_risk_score(p) >= _score_threshold(risk_profile)
+    ]
+
+    if not candidates:
+        return {
+            "error":   "no_results",
+            "message": f"No {category} protocols found with profile '{risk_profile}'.",
+        }
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best = candidates[0]
+    alts = candidates[1:3]
+
+    tvl = best.get("tvl") or 0
+    reasoning = (
+        f"Largest {category} protocol by TVL "
+        f"(${tvl/1e9:.1f}B). " if tvl >= 1e9 else f"TVL ${tvl/1e6:.0f}M. "
+    )
+    reasoning += f"Risk score {best_score}/100. "
+    if restaking_type == "liquid-restaking":
+        reasoning += "Issues LRT token for DeFi composability."
+    else:
+        reasoning += "Base restaking layer — AVS rewards on top of staking yield."
+
+    return {
+        "recommendation": _compact_protocol(best, best_score),
+        "reasoning":      reasoning,
+        "alternatives":   [_compact_protocol(p, s) for s, p in alts],
+        "restaking_type": restaking_type,
+        "risk_profile":   risk_profile,
+        "price":          "0.05 USDC",
+    }
+
+
+# ── Outil : get_best_rwa ──────────────────────────────────────────────────────
+@mcp.tool
+async def get_best_rwa(
+    risk_profile: Annotated[str, "'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)"] = "moderate",
+    rwa_type: Annotated[str, "Filter by RWA type. Options: 'all', 't-bills', 'private-credit', 'real-estate'. Default: 'all'"] = "all",
+) -> dict:
+    """Select the best Real World Asset (RWA) protocol by TVL and risk profile.
+
+    Covers tokenized T-bills (Ondo USDY, BlackRock BUIDL), private credit
+    (Maple, Centrifuge), and real estate protocols. Scored by TVL, audits, age.
+
+    Use this when: an agent needs stable off-chain backed yield.
+    Do NOT use for: on-chain DeFi yields (use get_best_yield).
+
+    Args:
+        risk_profile : 'safe', 'moderate', or 'max_yield'
+        rwa_type     : 'all', 't-bills', 'private-credit', 'real-estate'
+
+    Returns:
+        JSON with top 3 RWA protocols ranked by risk score. Price: 0.05 USDC
+    """
+    protocols = await _fetch_protocols_by_category("RWA")
+
+    # Filtre par type RWA (heuristique sur le nom)
+    TYPE_KEYWORDS = {
+        "t-bills":        ["ondo", "buidl", "spiko", "usdy", "ousg", "treasury", "tbill"],
+        "private-credit": ["maple", "centrifuge", "goldfinch", "credix", "clearpool"],
+        "real-estate":    ["tangible", "realt", "real-estate", "homium", "property"],
+    }
+
+    def matches_type(p, rwa_type):
+        if rwa_type == "all":
+            return True
+        keywords = TYPE_KEYWORDS.get(rwa_type, [])
+        name = (p.get("name") or "").lower()
+        slug = (p.get("slug") or "").lower()
+        return any(kw in name or kw in slug for kw in keywords)
+
+    candidates = [
+        (_protocol_risk_score(p), p) for p in protocols
+        if (p.get("tvl") or 0) >= 1_000_000
+        and matches_type(p, rwa_type)
+        and _protocol_risk_score(p) >= _score_threshold(risk_profile)
+    ]
+
+    if not candidates:
+        # Fallback sans filtre type
+        candidates = [
+            (_protocol_risk_score(p), p) for p in protocols
+            if (p.get("tvl") or 0) >= 1_000_000
+            and _protocol_risk_score(p) >= _score_threshold(risk_profile)
+        ]
+
+    if not candidates:
+        return {
+            "error":   "no_results",
+            "message": f"No RWA protocols found with profile '{risk_profile}'.",
+        }
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top3 = candidates[:3]
+
+    return {
+        "top_rwa_protocols": [_compact_protocol(p, s) for s, p in top3],
+        "rwa_type":          rwa_type,
+        "risk_profile":      risk_profile,
+        "note":              "RWA yields vary — check protocol docs for current APY (off-chain backed).",
+        "price":             "0.05 USDC",
+    }
+
+
+# ── Outil : get_perps_overview ────────────────────────────────────────────────
+@mcp.tool
+async def get_perps_overview(
+    chain: Annotated[str, "'all' or chain name: 'Arbitrum', 'Solana', 'Base', 'BSC'"] = "all",
+    top_n: Annotated[int, "Number of protocols to return (1-10). Default: 5"] = 5,
+) -> dict:
+    """Get top perpetuals/derivatives protocols ranked by 24h volume.
+
+    Covers Hyperliquid, dYdX, GMX, Drift, Jupiter Perps, and 50+ others.
+    Returns volume, open interest, and market share for each protocol.
+
+    Use this when: an agent needs derivatives market intelligence.
+    Do NOT use for: spot DEX (use DeFiLlama DEX endpoints), yield (use get_best_yield).
+
+    Args:
+        chain  : 'all' or specific chain filter
+        top_n  : Number of top protocols to return (1-10)
+
+    Returns:
+        JSON with ranked perps protocols, 24h volume, market share. Price: 0.05 USDC
+    """
+    protocols = await _fetch_perps()
+    top_n = max(1, min(10, top_n))
+
+    # Filtrer par chain si spécifié
+    if chain != "all":
+        filtered = [
+            p for p in protocols
+            if chain.lower() in [c.lower() for c in (p.get("chains") or [])]
+        ]
+        if not filtered:
+            filtered = protocols  # fallback si chain non trouvée
+    else:
+        filtered = protocols
+
+    # Trier par volume 24h
+    def get_volume(p):
+        v = p.get("totalAllTime") or p.get("total24h") or p.get("total7d") or 0
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return 0
+
+    ranked = sorted(filtered, key=get_volume, reverse=True)[:top_n]
+
+    if not ranked:
+        return {"error": "no_results", "message": "No perps data available."}
+
+    # Total volume pour market share
+    total_vol = sum(get_volume(p) for p in ranked)
+
+    result = []
+    for p in ranked:
+        vol = get_volume(p)
+        market_share = round(vol / total_vol * 100, 1) if total_vol > 0 else 0
+        result.append({
+            "protocol":     p.get("name") or p.get("module", "unknown"),
+            "chains":       (p.get("chains") or [])[:3],
+            "volume_24h":   int(p.get("total24h") or 0),
+            "volume_7d":    int(p.get("total7d") or 0),
+            "market_share": market_share,
+        })
+
+    return {
+        "top_perps": result,
+        "chain":     chain,
+        "total_24h_volume_usd": int(sum(int(r["volume_24h"]) for r in result)),
+        "price":     "0.05 USDC",
+    }
+
+
+# ── Outil : compare_perps ─────────────────────────────────────────────────────
+@mcp.tool
+async def compare_perps(
+    protocols: Annotated[list[str], "Protocol names to compare (2-5). Examples: ['Hyperliquid', 'GMX', 'dYdX', 'Drift']"],
+) -> dict:
+    """Compare perpetuals protocols side-by-side by volume and activity.
+
+    Args:
+        protocols : List of 2-5 protocol names to compare
+
+    Returns:
+        JSON with side-by-side metrics and winner by 24h volume. Price: 0.05 USDC
+    """
+    if len(protocols) < 2:
+        return {"error": "Provide at least 2 protocols to compare."}
+    if len(protocols) > 5:
+        return {"error": "Maximum 5 protocols per comparison."}
+
+    all_perps = await _fetch_perps()
+
+    results = []
+    for slug in protocols:
+        match = next(
+            (p for p in all_perps
+             if slug.lower() in (p.get("name") or "").lower()
+             or slug.lower() in (p.get("module") or "").lower()),
+            None,
+        )
+        if match:
+            vol_24h = float(match.get("total24h") or 0)
+            vol_7d  = float(match.get("total7d") or 0)
+            results.append({
+                "protocol":   match.get("name") or slug,
+                "chains":     (match.get("chains") or [])[:3],
+                "volume_24h": int(vol_24h),
+                "volume_7d":  int(vol_7d),
+                "volume_30d": int(float(match.get("total30d") or 0)),
+            })
+        else:
+            results.append({"protocol": slug, "status": "not_found"})
+
+    valid = [r for r in results if "volume_24h" in r]
+    valid.sort(key=lambda x: x["volume_24h"], reverse=True)
+    winner = valid[0] if valid else None
+
+    return {
+        "comparison": valid + [r for r in results if "volume_24h" not in r],
+        "winner":     winner,
+        "price":      "0.05 USDC",
+    }
+
+
+# ── Outil : get_defi_overview (maître) ───────────────────────────────────────
+@mcp.tool
+async def get_defi_overview() -> dict:
+    """Complete DeFi market snapshot across all categories. FREE.
+
+    Returns top protocol per category: Yield, Liquid Staking, Restaking,
+    RWA, and Perps top-3. Ideal first call for agents needing market context
+    before deciding which category to explore deeper.
+
+    Use this as a starting point before calling category-specific tools.
+    This call is FREE — use it to decide which paid tool to call next.
+
+    Returns:
+        JSON with market leaders per category + TVL + quick stats.
+    """
+    try:
+        all_p = await _fetch_all_protocols()
+
+        def top_by_category(cat, n=3):
+            filtered = [p for p in all_p if (p.get("category") or "").lower() == cat.lower()]
+            filtered.sort(key=lambda x: float(x.get("tvl") or 0), reverse=True)
+            return [
+                {
+                    "name":    p.get("name"),
+                    "tvl_usd": int(float(p.get("tvl") or 0)),
+                    "chains":  (p.get("chains") or [])[:2],
+                }
+                for p in filtered[:n]
+            ]
+
+        # Perps top 3 by volume
+        perps_data = await _fetch_perps()
+        perps_data.sort(key=lambda p: float(p.get("total24h") or 0), reverse=True)
+        top_perps = [
+            {
+                "name":       p.get("name") or p.get("module"),
+                "volume_24h": int(float(p.get("total24h") or 0)),
+            }
+            for p in perps_data[:3]
+        ]
+
+        return {
+            "liquid_staking": top_by_category("Liquid Staking"),
+            "restaking":      top_by_category("Restaking"),
+            "liquid_restaking": top_by_category("Liquid Restaking"),
+            "rwa":            top_by_category("RWA"),
+            "perps_by_volume": top_perps,
+            "note": (
+                "Use get_best_liquid_staking, get_best_restaking, get_best_rwa, "
+                "get_perps_overview, or get_best_yield for detailed recommendations."
+            ),
+            "price": "free",
+        }
+
+    except Exception as e:
+        log.error(f"get_defi_overview error: {e}")
+        return {"error": str(e), "message": "Could not load overview. Try individual tools."}
+
 # ── Build app complète (custom routes + x402) ────────────────────────────────
 def build_full_app(mcp_server):
     """
@@ -1704,521 +2223,3 @@ async def agent_card_a2a(request: Request) -> JSONResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PARTIE 5 : BATCH 1 — PERPS / LIQUID STAKING / RESTAKING / RWA
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ── Caches supplémentaires ────────────────────────────────────────────────────
-_PROTOCOLS_CACHE: dict = {"data": None, "updated_at": 0.0}
-_PERPS_CACHE:     dict = {"data": None, "updated_at": 0.0}
-_PROTOCOLS_TTL = 300   # 5 min
-_PERPS_TTL     = 180   # 3 min (volumes changent vite)
-
-
-async def _fetch_all_protocols() -> list[dict]:
-    """Récupère tous les protocoles DeFiLlama avec cache 5 min."""
-    now = time.time()
-    if _PROTOCOLS_CACHE["data"] and (now - _PROTOCOLS_CACHE["updated_at"]) < _PROTOCOLS_TTL:
-        return _PROTOCOLS_CACHE["data"]
-    log.info("Fetching protocols from DeFiLlama…")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get("https://api.llama.fi/protocols")
-        r.raise_for_status()
-        data = r.json()
-    _PROTOCOLS_CACHE["data"]       = data
-    _PROTOCOLS_CACHE["updated_at"] = now
-    log.info(f"Loaded {len(data)} protocols")
-    return data
-
-
-async def _fetch_protocols_by_category(category: str) -> list[dict]:
-    """Filtre les protocoles par catégorie DeFiLlama (case-insensitive)."""
-    all_p = await _fetch_all_protocols()
-    return [p for p in all_p
-            if (p.get("category") or "").lower() == category.lower()]
-
-
-async def _fetch_perps() -> list[dict]:
-    """Récupère les données perpetuals/derivatives DeFiLlama."""
-    now = time.time()
-    if _PERPS_CACHE["data"] and (now - _PERPS_CACHE["updated_at"]) < _PERPS_TTL:
-        return _PERPS_CACHE["data"]
-    log.info("Fetching perps data from DeFiLlama…")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get("https://api.llama.fi/overview/derivatives")
-        r.raise_for_status()
-        data = r.json()
-    protocols = data.get("protocols", []) if isinstance(data, dict) else data
-    _PERPS_CACHE["data"]       = protocols
-    _PERPS_CACHE["updated_at"] = now
-    log.info(f"Loaded {len(protocols)} perps protocols")
-    return protocols
-
-
-# ── Risk score pour protocoles (TVL + ancienneté + audits) ───────────────────
-def _protocol_risk_score(p: dict) -> int:
-    """
-    Score 0-100 pour protocoles staking/RWA basé sur TVL, audits, ancienneté.
-    Différent du _risk_score() pool qui utilise APY + outlier.
-    """
-    score = 50
-    tvl = p.get("tvl") or 0
-
-    # TVL — proxy confiance marché
-    if tvl >= 5_000_000_000:  score += 25
-    elif tvl >= 1_000_000_000: score += 20
-    elif tvl >= 100_000_000:   score += 12
-    elif tvl >= 10_000_000:    score += 5
-    else:                      score -= 15
-
-    # Audits
-    audits = p.get("audits") or "0"
-    try:
-        if int(audits) >= 2: score += 8
-        elif int(audits) == 1: score += 4
-    except (ValueError, TypeError):
-        pass
-
-    # Ancienneté (listedAt en timestamp Unix)
-    listed = p.get("listedAt") or 0
-    age_days = (time.time() - listed) / 86400 if listed else 0
-    if age_days >= 730:  score += 10   # > 2 ans
-    elif age_days >= 365: score += 7   # > 1 an
-    elif age_days >= 180: score += 3
-
-    # Momentum TVL 7j
-    change7d = p.get("change_7d") or 0
-    try:
-        c = float(change7d)
-        if c > 5:    score += 3
-        elif c < -15: score -= 8
-    except (ValueError, TypeError):
-        pass
-
-    return max(0, min(100, score))
-
-
-def _compact_protocol(p: dict, score: int) -> dict:
-    """Output compact pour protocoles (staking, RWA…)."""
-    return {
-        "protocol":    p.get("slug") or p.get("name", "unknown"),
-        "name":        p.get("name", "unknown"),
-        "category":    p.get("category", "unknown"),
-        "chains":      (p.get("chains") or [])[:4],
-        "tvl_usd":     int(p.get("tvl") or 0),
-        "change_7d":   round(float(p.get("change_7d") or 0), 1),
-        "risk_score":  score,
-        "risk_level":  _risk_label(score),
-        "url":         p.get("url") or f"https://defillama.com/protocol/{p.get('slug','')}",
-    }
-
-
-# ── Outil : get_best_liquid_staking ──────────────────────────────────────────
-@mcp.tool
-async def get_best_liquid_staking(
-    asset: Annotated[str, "Asset to stake. Examples: 'ETH', 'SOL', 'BNB', 'MATIC'"] = "ETH",
-    risk_profile: Annotated[str, "'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)"] = "moderate",
-    chain: Annotated[str, "'all' or chain name: 'Ethereum', 'Solana', 'BNB Chain'"] = "all",
-) -> dict:
-    """Select the best liquid staking protocol for a given asset and risk profile.
-
-    Scores protocols by TVL, audit count, age, and momentum. Returns one
-    recommendation with reasoning and top alternatives.
-    Covers: Lido, Rocket Pool, Coinbase cbETH, Jito, Marinade, and 50+ others.
-
-    Use this when: an agent needs to stake an asset while keeping it liquid.
-    Do NOT use for: yield farming (use get_best_yield), restaking (use get_best_restaking).
-
-    Args:
-        asset        : Asset to stake. Examples: 'ETH', 'SOL', 'BNB'
-        risk_profile : 'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)
-        chain        : 'all' or specific chain
-
-    Returns:
-        JSON with recommendation {protocol, name, tvl_usd, risk_score, chains},
-        reasoning, alternatives (top 2). Price: 0.05 USDC
-    """
-    protocols = await _fetch_protocols_by_category("Liquid Staking")
-
-    # Filtre par chain et asset (dans le nom ou symbol)
-    candidates = []
-    for p in protocols:
-        if chain != "all":
-            chains = [c.lower() for c in (p.get("chains") or [])]
-            if chain.lower() not in chains:
-                continue
-        # Filtre asset par symbol/name (heuristique)
-        if asset.upper() not in ["ALL", "ANY"]:
-            name_sym = f"{p.get('name','')} {p.get('symbol','')}".upper()
-            if asset.upper() not in name_sym and asset.upper() not in [
-                c.upper() for c in (p.get("chains") or [])
-            ]:
-                # Cas spéciaux : ETH → accepter tout sur Ethereum
-                if asset.upper() == "ETH" and "Ethereum" not in (p.get("chains") or []):
-                    continue
-                # SOL → accepter tout sur Solana
-                elif asset.upper() == "SOL" and "Solana" not in (p.get("chains") or []):
-                    continue
-                elif asset.upper() not in ("ETH", "SOL"):
-                    continue
-
-        if (p.get("tvl") or 0) < 1_000_000:
-            continue
-
-        score = _protocol_risk_score(p)
-        if score < _score_threshold(risk_profile):
-            continue
-        candidates.append((score, p))
-
-    if not candidates:
-        # Fallback : retourner les meilleurs sans filtre asset
-        all_ls = await _fetch_protocols_by_category("Liquid Staking")
-        candidates = [(s := _protocol_risk_score(p), p)
-                      for p in all_ls if (p.get("tvl") or 0) > 10_000_000
-                      and s >= _score_threshold(risk_profile)][:10]
-
-    if not candidates:
-        return {
-            "error":   "no_results",
-            "message": f"No liquid staking protocols found for {asset} with profile '{risk_profile}'.",
-        }
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best = candidates[0]
-    alts = candidates[1:3]
-
-    reasoning_parts = [
-        f"TVL ${int(best.get('tvl') or 0)/1e9:.1f}B." if (best.get("tvl") or 0) >= 1e9
-        else f"TVL ${int(best.get('tvl') or 0)/1e6:.0f}M.",
-        f"Active on {len(best.get('chains') or [])} chains.",
-    ]
-    age_days = (time.time() - (best.get("listedAt") or 0)) / 86400
-    if age_days > 365:
-        reasoning_parts.append(f"Protocol age {int(age_days/365)}y+ — established.")
-    try:
-        if int(best.get("audits") or 0) >= 1:
-            reasoning_parts.append("Audited.")
-    except (ValueError, TypeError):
-        pass
-
-    return {
-        "recommendation": _compact_protocol(best, best_score),
-        "reasoning":      " ".join(reasoning_parts),
-        "alternatives":   [_compact_protocol(p, s) for s, p in alts],
-        "asset":          asset,
-        "risk_profile":   risk_profile,
-        "price":          "0.05 USDC",
-    }
-
-
-# ── Outil : get_best_restaking ────────────────────────────────────────────────
-@mcp.tool
-async def get_best_restaking(
-    risk_profile: Annotated[str, "'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)"] = "moderate",
-    restaking_type: Annotated[str, "'restaking' (base layer: EigenLayer, Symbiotic) or 'liquid-restaking' (LRT tokens: EtherFi, Renzo, Puffer)"] = "liquid-restaking",
-) -> dict:
-    """Select the best restaking protocol by TVL and risk profile.
-
-    Covers base restaking (EigenLayer, Symbiotic, Karak) and liquid restaking
-    tokens (EtherFi, Renzo, Puffer, Kelp). Scored by TVL, audits, and age.
-
-    Use this when: an agent wants to restake ETH or LSTs for additional yield.
-    Do NOT use for: simple staking (use get_best_liquid_staking).
-
-    Args:
-        risk_profile    : 'safe', 'moderate', or 'max_yield'
-        restaking_type  : 'restaking' or 'liquid-restaking'
-
-    Returns:
-        JSON with recommendation, reasoning, alternatives. Price: 0.05 USDC
-    """
-    category = "Liquid Restaking" if restaking_type == "liquid-restaking" else "Restaking"
-    protocols = await _fetch_protocols_by_category(category)
-
-    candidates = [
-        (_protocol_risk_score(p), p) for p in protocols
-        if (p.get("tvl") or 0) >= 1_000_000
-        and _protocol_risk_score(p) >= _score_threshold(risk_profile)
-    ]
-
-    if not candidates:
-        return {
-            "error":   "no_results",
-            "message": f"No {category} protocols found with profile '{risk_profile}'.",
-        }
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best = candidates[0]
-    alts = candidates[1:3]
-
-    tvl = best.get("tvl") or 0
-    reasoning = (
-        f"Largest {category} protocol by TVL "
-        f"(${tvl/1e9:.1f}B). " if tvl >= 1e9 else f"TVL ${tvl/1e6:.0f}M. "
-    )
-    reasoning += f"Risk score {best_score}/100. "
-    if restaking_type == "liquid-restaking":
-        reasoning += "Issues LRT token for DeFi composability."
-    else:
-        reasoning += "Base restaking layer — AVS rewards on top of staking yield."
-
-    return {
-        "recommendation": _compact_protocol(best, best_score),
-        "reasoning":      reasoning,
-        "alternatives":   [_compact_protocol(p, s) for s, p in alts],
-        "restaking_type": restaking_type,
-        "risk_profile":   risk_profile,
-        "price":          "0.05 USDC",
-    }
-
-
-# ── Outil : get_best_rwa ──────────────────────────────────────────────────────
-@mcp.tool
-async def get_best_rwa(
-    risk_profile: Annotated[str, "'safe' (score>=75), 'moderate' (>=55), 'max_yield' (>=35)"] = "moderate",
-    rwa_type: Annotated[str, "Filter by RWA type. Options: 'all', 't-bills', 'private-credit', 'real-estate'. Default: 'all'"] = "all",
-) -> dict:
-    """Select the best Real World Asset (RWA) protocol by TVL and risk profile.
-
-    Covers tokenized T-bills (Ondo USDY, BlackRock BUIDL), private credit
-    (Maple, Centrifuge), and real estate protocols. Scored by TVL, audits, age.
-
-    Use this when: an agent needs stable off-chain backed yield.
-    Do NOT use for: on-chain DeFi yields (use get_best_yield).
-
-    Args:
-        risk_profile : 'safe', 'moderate', or 'max_yield'
-        rwa_type     : 'all', 't-bills', 'private-credit', 'real-estate'
-
-    Returns:
-        JSON with top 3 RWA protocols ranked by risk score. Price: 0.05 USDC
-    """
-    protocols = await _fetch_protocols_by_category("RWA")
-
-    # Filtre par type RWA (heuristique sur le nom)
-    TYPE_KEYWORDS = {
-        "t-bills":        ["ondo", "buidl", "spiko", "usdy", "ousg", "treasury", "tbill"],
-        "private-credit": ["maple", "centrifuge", "goldfinch", "credix", "clearpool"],
-        "real-estate":    ["tangible", "realt", "real-estate", "homium", "property"],
-    }
-
-    def matches_type(p, rwa_type):
-        if rwa_type == "all":
-            return True
-        keywords = TYPE_KEYWORDS.get(rwa_type, [])
-        name = (p.get("name") or "").lower()
-        slug = (p.get("slug") or "").lower()
-        return any(kw in name or kw in slug for kw in keywords)
-
-    candidates = [
-        (_protocol_risk_score(p), p) for p in protocols
-        if (p.get("tvl") or 0) >= 1_000_000
-        and matches_type(p, rwa_type)
-        and _protocol_risk_score(p) >= _score_threshold(risk_profile)
-    ]
-
-    if not candidates:
-        # Fallback sans filtre type
-        candidates = [
-            (_protocol_risk_score(p), p) for p in protocols
-            if (p.get("tvl") or 0) >= 1_000_000
-            and _protocol_risk_score(p) >= _score_threshold(risk_profile)
-        ]
-
-    if not candidates:
-        return {
-            "error":   "no_results",
-            "message": f"No RWA protocols found with profile '{risk_profile}'.",
-        }
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    top3 = candidates[:3]
-
-    return {
-        "top_rwa_protocols": [_compact_protocol(p, s) for s, p in top3],
-        "rwa_type":          rwa_type,
-        "risk_profile":      risk_profile,
-        "note":              "RWA yields vary — check protocol docs for current APY (off-chain backed).",
-        "price":             "0.05 USDC",
-    }
-
-
-# ── Outil : get_perps_overview ────────────────────────────────────────────────
-@mcp.tool
-async def get_perps_overview(
-    chain: Annotated[str, "'all' or chain name: 'Arbitrum', 'Solana', 'Base', 'BSC'"] = "all",
-    top_n: Annotated[int, "Number of protocols to return (1-10). Default: 5"] = 5,
-) -> dict:
-    """Get top perpetuals/derivatives protocols ranked by 24h volume.
-
-    Covers Hyperliquid, dYdX, GMX, Drift, Jupiter Perps, and 50+ others.
-    Returns volume, open interest, and market share for each protocol.
-
-    Use this when: an agent needs derivatives market intelligence.
-    Do NOT use for: spot DEX (use DeFiLlama DEX endpoints), yield (use get_best_yield).
-
-    Args:
-        chain  : 'all' or specific chain filter
-        top_n  : Number of top protocols to return (1-10)
-
-    Returns:
-        JSON with ranked perps protocols, 24h volume, market share. Price: 0.05 USDC
-    """
-    protocols = await _fetch_perps()
-    top_n = max(1, min(10, top_n))
-
-    # Filtrer par chain si spécifié
-    if chain != "all":
-        filtered = [
-            p for p in protocols
-            if chain.lower() in [c.lower() for c in (p.get("chains") or [])]
-        ]
-        if not filtered:
-            filtered = protocols  # fallback si chain non trouvée
-    else:
-        filtered = protocols
-
-    # Trier par volume 24h
-    def get_volume(p):
-        v = p.get("totalAllTime") or p.get("total24h") or p.get("total7d") or 0
-        try:
-            return float(v)
-        except (ValueError, TypeError):
-            return 0
-
-    ranked = sorted(filtered, key=get_volume, reverse=True)[:top_n]
-
-    if not ranked:
-        return {"error": "no_results", "message": "No perps data available."}
-
-    # Total volume pour market share
-    total_vol = sum(get_volume(p) for p in ranked)
-
-    result = []
-    for p in ranked:
-        vol = get_volume(p)
-        market_share = round(vol / total_vol * 100, 1) if total_vol > 0 else 0
-        result.append({
-            "protocol":     p.get("name") or p.get("module", "unknown"),
-            "chains":       (p.get("chains") or [])[:3],
-            "volume_24h":   int(p.get("total24h") or 0),
-            "volume_7d":    int(p.get("total7d") or 0),
-            "market_share": market_share,
-        })
-
-    return {
-        "top_perps": result,
-        "chain":     chain,
-        "total_24h_volume_usd": int(sum(int(r["volume_24h"]) for r in result)),
-        "price":     "0.05 USDC",
-    }
-
-
-# ── Outil : compare_perps ─────────────────────────────────────────────────────
-@mcp.tool
-async def compare_perps(
-    protocols: Annotated[list[str], "Protocol names to compare (2-5). Examples: ['Hyperliquid', 'GMX', 'dYdX', 'Drift']"],
-) -> dict:
-    """Compare perpetuals protocols side-by-side by volume and activity.
-
-    Args:
-        protocols : List of 2-5 protocol names to compare
-
-    Returns:
-        JSON with side-by-side metrics and winner by 24h volume. Price: 0.05 USDC
-    """
-    if len(protocols) < 2:
-        return {"error": "Provide at least 2 protocols to compare."}
-    if len(protocols) > 5:
-        return {"error": "Maximum 5 protocols per comparison."}
-
-    all_perps = await _fetch_perps()
-
-    results = []
-    for slug in protocols:
-        match = next(
-            (p for p in all_perps
-             if slug.lower() in (p.get("name") or "").lower()
-             or slug.lower() in (p.get("module") or "").lower()),
-            None,
-        )
-        if match:
-            vol_24h = float(match.get("total24h") or 0)
-            vol_7d  = float(match.get("total7d") or 0)
-            results.append({
-                "protocol":   match.get("name") or slug,
-                "chains":     (match.get("chains") or [])[:3],
-                "volume_24h": int(vol_24h),
-                "volume_7d":  int(vol_7d),
-                "volume_30d": int(float(match.get("total30d") or 0)),
-            })
-        else:
-            results.append({"protocol": slug, "status": "not_found"})
-
-    valid = [r for r in results if "volume_24h" in r]
-    valid.sort(key=lambda x: x["volume_24h"], reverse=True)
-    winner = valid[0] if valid else None
-
-    return {
-        "comparison": valid + [r for r in results if "volume_24h" not in r],
-        "winner":     winner,
-        "price":      "0.05 USDC",
-    }
-
-
-# ── Outil : get_defi_overview (maître) ───────────────────────────────────────
-@mcp.tool
-async def get_defi_overview() -> dict:
-    """Complete DeFi market snapshot across all categories. FREE.
-
-    Returns top protocol per category: Yield, Liquid Staking, Restaking,
-    RWA, and Perps top-3. Ideal first call for agents needing market context
-    before deciding which category to explore deeper.
-
-    Use this as a starting point before calling category-specific tools.
-    This call is FREE — use it to decide which paid tool to call next.
-
-    Returns:
-        JSON with market leaders per category + TVL + quick stats.
-    """
-    try:
-        all_p = await _fetch_all_protocols()
-
-        def top_by_category(cat, n=3):
-            filtered = [p for p in all_p if (p.get("category") or "").lower() == cat.lower()]
-            filtered.sort(key=lambda x: float(x.get("tvl") or 0), reverse=True)
-            return [
-                {
-                    "name":    p.get("name"),
-                    "tvl_usd": int(float(p.get("tvl") or 0)),
-                    "chains":  (p.get("chains") or [])[:2],
-                }
-                for p in filtered[:n]
-            ]
-
-        # Perps top 3 by volume
-        perps_data = await _fetch_perps()
-        perps_data.sort(key=lambda p: float(p.get("total24h") or 0), reverse=True)
-        top_perps = [
-            {
-                "name":       p.get("name") or p.get("module"),
-                "volume_24h": int(float(p.get("total24h") or 0)),
-            }
-            for p in perps_data[:3]
-        ]
-
-        return {
-            "liquid_staking": top_by_category("Liquid Staking"),
-            "restaking":      top_by_category("Restaking"),
-            "liquid_restaking": top_by_category("Liquid Restaking"),
-            "rwa":            top_by_category("RWA"),
-            "perps_by_volume": top_perps,
-            "note": (
-                "Use get_best_liquid_staking, get_best_restaking, get_best_rwa, "
-                "get_perps_overview, or get_best_yield for detailed recommendations."
-            ),
-            "price": "free",
-        }
-
-    except Exception as e:
-        log.error(f"get_defi_overview error: {e}")
-        return {"error": str(e), "message": "Could not load overview. Try individual tools."}
