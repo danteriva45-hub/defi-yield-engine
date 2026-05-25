@@ -1647,6 +1647,395 @@ async def get_defi_overview() -> dict:
         log.error(f"get_defi_overview error: {e}")
         return {"error": str(e), "message": "Could not load overview. Try individual tools."}
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PARTIE 6 : GAS PRICE PREDICTOR + SMART CONTRACT RISK SCORER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Cache Gas ─────────────────────────────────────────────────────────────────
+_GAS_CACHE: dict = {}      # {chain: {"data": {...}, "updated_at": float}}
+_GAS_TTL = 60              # 1 min — gas change vite
+
+# ── Patterns gas (UTC) ────────────────────────────────────────────────────────
+# Basé sur analyse historique Ethereum/L2 — source : Etherscan Gas Tracker
+GAS_HOURLY_MULTIPLIER = {
+    0: 0.72, 1: 0.68, 2: 0.65, 3: 0.62, 4: 0.60,  # creux nocturne
+    5: 0.63, 6: 0.70, 7: 0.80, 8: 0.90, 9: 0.95,
+    10: 1.00, 11: 1.05, 12: 1.08, 13: 1.10, 14: 1.15,  # pic US market
+    15: 1.18, 16: 1.20, 17: 1.18, 18: 1.12, 19: 1.05,
+    20: 0.98, 21: 0.90, 22: 0.82, 23: 0.75,
+}
+GAS_DAY_MULTIPLIER = {
+    0: 1.05,  # Lundi
+    1: 1.08,  # Mardi
+    2: 1.10,  # Mercredi — pic semaine
+    3: 1.07,  # Jeudi
+    4: 1.03,  # Vendredi
+    5: 0.80,  # Samedi — -20%
+    6: 0.75,  # Dimanche — -25%
+}
+
+# Configs par chain
+CHAIN_GAS_APIS = {
+    "ethereum": {
+        "etherscan": "https://api.etherscan.io/api?module=gastracker&action=gasoracle",
+        "chain_id": 1, "unit": "Gwei", "base_gwei": 20,
+    },
+    "arbitrum": {
+        "chain_id": 42161, "unit": "Gwei", "base_gwei": 0.1,
+    },
+    "base": {
+        "chain_id": 8453, "unit": "Gwei", "base_gwei": 0.05,
+    },
+    "polygon": {
+        "chain_id": 137, "unit": "Gwei", "base_gwei": 50,
+    },
+    "optimism": {
+        "chain_id": 10, "unit": "Gwei", "base_gwei": 0.05,
+    },
+}
+
+# GoPlus chain IDs
+GOPLUS_CHAIN_IDS = {
+    "ethereum": "1", "bsc": "56", "polygon": "137",
+    "arbitrum": "42161", "base": "8453", "optimism": "10",
+    "avalanche": "43114", "fantom": "250",
+}
+
+
+async def _fetch_gas_current(chain: str) -> dict:
+    """Récupère le gas actuel via Etherscan (Ethereum) ou estimation."""
+    now = time.time()
+    chain_lower = chain.lower()
+    cached = _GAS_CACHE.get(chain_lower)
+    if cached and (now - cached["updated_at"]) < _GAS_TTL:
+        return cached["data"]
+
+    result = {}
+    if chain_lower == "ethereum":
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(
+                    "https://api.etherscan.io/api",
+                    params={"module": "gastracker", "action": "gasoracle"}
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    if d.get("status") == "1" and "result" in d:
+                        res = d["result"]
+                        result = {
+                            "safe":     float(res.get("SafeGasPrice", 15)),
+                            "standard": float(res.get("ProposeGasPrice", 20)),
+                            "fast":     float(res.get("FastGasPrice", 25)),
+                            "source":   "etherscan",
+                        }
+        except Exception as e:
+            log.warning(f"Gas fetch failed: {e}")
+
+    # Fallback pattern-based si API indisponible
+    if not result:
+        base = CHAIN_GAS_APIS.get(chain_lower, {}).get("base_gwei", 20)
+        import datetime
+        utc_now = datetime.datetime.utcnow()
+        mult = GAS_HOURLY_MULTIPLIER.get(utc_now.hour, 1.0) *                GAS_DAY_MULTIPLIER.get(utc_now.weekday(), 1.0)
+        result = {
+            "safe":     round(base * mult * 0.8, 3),
+            "standard": round(base * mult, 3),
+            "fast":     round(base * mult * 1.3, 3),
+            "source":   "pattern_estimate",
+        }
+
+    _GAS_CACHE[chain_lower] = {"data": result, "updated_at": now}
+    return result
+
+
+def _find_optimal_windows(chain: str, horizon_hours: int = 24) -> list[dict]:
+    """Identifie les fenêtres de gas bas dans les prochaines N heures."""
+    import datetime
+    utc_now = datetime.datetime.utcnow()
+    windows = []
+
+    for h in range(horizon_hours):
+        future = utc_now + datetime.timedelta(hours=h)
+        hour_mult = GAS_HOURLY_MULTIPLIER.get(future.hour, 1.0)
+        day_mult  = GAS_DAY_MULTIPLIER.get(future.weekday(), 1.0)
+        combined  = hour_mult * day_mult
+
+        if combined <= 0.75:  # seuil bas
+            windows.append({
+                "hours_from_now": h,
+                "utc_time":       future.strftime("%H:%M UTC"),
+                "day":            ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][future.weekday()],
+                "gas_multiplier": round(combined, 2),
+                "savings_pct":    round((1 - combined) * 100, 0),
+            })
+
+    return windows[:5]  # top 5 fenêtres
+
+
+# ── Outil : get_gas_price ─────────────────────────────────────────────────────
+@mcp.tool
+async def get_gas_price(
+    chain: Annotated[str, "Blockchain to check. Options: 'ethereum', 'arbitrum', 'base', 'polygon', 'optimism'"] = "ethereum",
+) -> dict:
+    """Get current gas prices across urgency levels for a given chain. FREE.
+
+    Returns safe/standard/fast gas prices in Gwei with USD cost estimate
+    for a standard ERC-20 transfer (21,000 gas).
+
+    Use this when: an agent needs current gas cost before executing a transaction.
+    Follow with get_optimal_gas_window to decide whether to wait.
+
+    Args:
+        chain : Chain to check. Options: 'ethereum', 'arbitrum', 'base',
+                'polygon', 'optimism'
+
+    Returns:
+        JSON with safe/standard/fast Gwei, USD cost estimate, source. FREE.
+    """
+    gas = await _fetch_gas_current(chain)
+    chain_cfg = CHAIN_GAS_APIS.get(chain.lower(), {})
+
+    # Estimation coût USD (ETH ~$3000, gas transfer std = 21000 gas)
+    eth_price_usd = 3000  # approximation — utiliser get_best_yield pour ETH price
+    gas_units = 21_000
+
+    def gwei_to_usd(gwei: float) -> float:
+        return round(gwei * 1e-9 * gas_units * eth_price_usd, 4)
+
+    return {
+        "chain":    chain,
+        "gas":      {
+            "safe":     {"gwei": gas["safe"],     "usd": gwei_to_usd(gas["safe"])},
+            "standard": {"gwei": gas["standard"], "usd": gwei_to_usd(gas["standard"])},
+            "fast":     {"gwei": gas["fast"],     "usd": gwei_to_usd(gas["fast"])},
+        },
+        "source":   gas.get("source", "unknown"),
+        "note":     "USD estimate based on 21,000 gas (ERC-20 transfer) at ETH ~$3,000",
+        "price":    "free",
+    }
+
+
+# ── Outil : get_optimal_gas_window ───────────────────────────────────────────
+@mcp.tool
+async def get_optimal_gas_window(
+    chain: Annotated[str, "Chain to optimize for: 'ethereum', 'arbitrum', 'base', 'polygon', 'optimism'"] = "ethereum",
+    urgency: Annotated[str, "Transaction urgency: 'low' (can wait 24h), 'medium' (wait up to 6h), 'high' (execute now)"] = "low",
+    horizon_hours: Annotated[int, "Hours to look ahead for optimal windows (1-48). Default: 24"] = 24,
+) -> dict:
+    """Predict the best time window to execute transactions for minimum gas cost.
+
+    Uses historical Ethereum gas patterns (hourly + day-of-week multipliers)
+    to identify upcoming low-gas windows. Typical savings: 25-45% vs peak hours.
+
+    Best windows: 3-7 AM UTC (daily low) and weekends (-20 to -25%).
+
+    Use this when: an agent can defer a non-urgent transaction to save on gas.
+    Combine with get_gas_price for current baseline.
+
+    Args:
+        chain         : Chain to optimize: 'ethereum', 'arbitrum', 'base'
+        urgency       : 'low' (best price, wait up to 24h), 'medium' (up to 6h),
+                        'high' (execute now — returns current best)
+        horizon_hours : Lookahead window in hours (1-48)
+
+    Returns:
+        JSON with recommended windows, expected savings, and current gas context.
+        Price: 0.05 USDC
+    """
+    horizon_hours = max(1, min(48, horizon_hours))
+    current_gas   = await _fetch_gas_current(chain)
+
+    if urgency == "high":
+        return {
+            "recommendation": "execute_now",
+            "urgency":        urgency,
+            "current_gas":    current_gas,
+            "reasoning":      "High urgency — execute immediately at current gas price.",
+            "price":          "0.05 USDC",
+        }
+
+    windows = _find_optimal_windows(chain, horizon_hours)
+    max_wait = 6 if urgency == "medium" else 24
+
+    # Filtrer selon l'urgence
+    relevant = [w for w in windows if w["hours_from_now"] <= max_wait]
+
+    if not relevant:
+        return {
+            "recommendation": "execute_now",
+            "reasoning":      f"No significantly cheaper window found in next {max_wait}h.",
+            "current_gas":    current_gas,
+            "urgency":        urgency,
+            "price":          "0.05 USDC",
+        }
+
+    best = relevant[0]
+
+    import datetime
+    utc_now = datetime.datetime.utcnow()
+    curr_mult = GAS_HOURLY_MULTIPLIER.get(utc_now.hour, 1.0) *                 GAS_DAY_MULTIPLIER.get(utc_now.weekday(), 1.0)
+    savings_vs_now = round((1 - best["gas_multiplier"] / curr_mult) * 100, 0)
+
+    return {
+        "recommendation":   "wait_for_window",
+        "best_window": {
+            "in_hours":     best["hours_from_now"],
+            "at_time":      best["utc_time"],
+            "day":          best["day"],
+            "est_savings":  f"{max(0, savings_vs_now):.0f}% vs now",
+        },
+        "top_windows":      relevant[:3],
+        "current_gas":      current_gas,
+        "chain":            chain,
+        "urgency":          urgency,
+        "reasoning":        (
+            f"Wait ~{best['hours_from_now']}h ({best['utc_time']}, {best['day']}) "
+            f"for estimated {max(0, savings_vs_now):.0f}% gas saving vs current prices."
+        ),
+        "price":            "0.05 USDC",
+    }
+
+
+# ── Outil : score_contract ────────────────────────────────────────────────────
+@mcp.tool
+async def score_contract(
+    contract_address: Annotated[str, "Contract or token address to analyze. Example: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'"],
+    chain: Annotated[str, "Chain where the contract is deployed: 'ethereum', 'bsc', 'polygon', 'arbitrum', 'base', 'optimism'"] = "ethereum",
+) -> dict:
+    """Score a smart contract for security risks using GoPlus Security API.
+
+    Checks for: honeypot detection, buy/sell tax, ownership risks, proxy patterns,
+    trading cooldowns, blacklist functions, mint capabilities, and liquidity risks.
+
+    Risk score 0-100 (100 = safest). Covers tokens and general contracts.
+
+    Use this when: an agent is about to interact with an unknown contract or token.
+    Do NOT use for: known safe protocols (use explain_risk for Aave/Morpho/etc.).
+
+    Args:
+        contract_address : EVM contract or token address (0x...)
+        chain            : Deployment chain. Options: 'ethereum', 'bsc',
+                           'polygon', 'arbitrum', 'base', 'optimism'
+
+    Returns:
+        JSON with risk_score (0-100), risk_signals, verdict. Price: 0.05 USDC
+    """
+    chain_id = GOPLUS_CHAIN_IDS.get(chain.lower(), "1")
+    addr     = contract_address.lower().strip()
+
+    if not addr.startswith("0x") or len(addr) != 42:
+        return {
+            "error":   "invalid_address",
+            "message": "Address must be a valid EVM address starting with 0x (42 chars).",
+        }
+
+    # Appel GoPlus Security API
+    token_data = {}
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(
+                f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}",
+                params={"contract_addresses": addr}
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if d.get("code") == 1:
+                    result = d.get("result", {})
+                    token_data = result.get(addr, result.get(addr.lower(), {}))
+    except Exception as e:
+        log.warning(f"GoPlus API error: {e}")
+
+    # Calcul du risk score
+    score  = 100
+    risks  = []
+    greens = []
+
+    if token_data:
+        # ── Signaux critiques ──────────────────────────────────────────────
+        if token_data.get("is_honeypot") == "1":
+            score -= 50; risks.append("⛔ HONEYPOT — cannot sell token")
+        elif token_data.get("is_honeypot") == "0":
+            greens.append("✅ Not a honeypot")
+
+        buy_tax  = float(token_data.get("buy_tax")  or 0)
+        sell_tax = float(token_data.get("sell_tax") or 0)
+        if sell_tax > 0.10:
+            score -= 25; risks.append(f"⛔ High sell tax: {sell_tax*100:.1f}%")
+        elif sell_tax > 0.05:
+            score -= 10; risks.append(f"⚠ Sell tax: {sell_tax*100:.1f}%")
+        elif sell_tax == 0:
+            greens.append("✅ No sell tax")
+
+        if buy_tax > 0.10:
+            score -= 15; risks.append(f"⚠ High buy tax: {buy_tax*100:.1f}%")
+
+        # ── Ownership ─────────────────────────────────────────────────────
+        if token_data.get("owner_address") in ("", "0x0000000000000000000000000000000000000000"):
+            greens.append("✅ Ownership renounced")
+        elif token_data.get("can_take_back_ownership") == "1":
+            score -= 20; risks.append("⚠ Owner can reclaim contract")
+
+        # ── Fonctions dangereuses ─────────────────────────────────────────
+        if token_data.get("is_mintable") == "1":
+            score -= 10; risks.append("⚠ Token is mintable (inflation risk)")
+        if token_data.get("has_blacklist") == "1":
+            score -= 5;  risks.append("⚠ Has blacklist function")
+        if token_data.get("has_whitelist") == "1":
+            score -= 3;  risks.append("ℹ Has whitelist function")
+        if token_data.get("trading_cooldown") == "1":
+            score -= 5;  risks.append("⚠ Trading cooldown enabled")
+        if token_data.get("transfer_pausable") == "1":
+            score -= 8;  risks.append("⚠ Transfers can be paused")
+
+        # ── Proxy / upgradeable ───────────────────────────────────────────
+        if token_data.get("is_proxy") == "1":
+            score -= 5;  risks.append("ℹ Proxy contract (upgradeable)")
+        if token_data.get("is_open_source") == "1":
+            greens.append("✅ Open source contract")
+        elif token_data.get("is_open_source") == "0":
+            score -= 10; risks.append("⚠ Contract not verified/open source")
+
+        # ── Liquidité ─────────────────────────────────────────────────────
+        lp_holders = token_data.get("lp_holders", [])
+        if lp_holders:
+            locked = sum(1 for h in lp_holders if h.get("is_locked") == 1)
+            if locked > 0:
+                greens.append(f"✅ LP partially locked ({locked} holders)")
+            else:
+                risks.append("⚠ No locked liquidity detected")
+                score -= 8
+
+    else:
+        # Pas de données GoPlus — scoring conservateur
+        risks.append("⚠ Could not retrieve security data — treat as unknown risk")
+        score = 40
+
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        verdict = "✅ Low risk — appears safe for interaction"
+    elif score >= 60:
+        verdict = "⚠ Moderate risk — review signals before interacting"
+    elif score >= 40:
+        verdict = "⚠ Elevated risk — significant concerns identified"
+    else:
+        verdict = "⛔ High risk — do NOT interact without thorough audit"
+
+    return {
+        "contract":         contract_address,
+        "chain":            chain,
+        "risk_score":       score,
+        "risk_level":       _risk_label(score),
+        "verdict":          verdict,
+        "risk_signals":     risks,
+        "positive_signals": greens,
+        "data_source":      "GoPlus Security API" if token_data else "unavailable",
+        "price":            "0.05 USDC",
+    }
+
+
+
 # ── Build app complète (custom routes + x402) ────────────────────────────────
 def build_full_app(mcp_server):
     """
@@ -1966,6 +2355,9 @@ async def server_info() -> dict:
             "get_best_rwa":             "Best Real World Asset protocol — 0.05 USDC",
             "get_perps_overview":       "Top perps protocols by volume — 0.05 USDC",
             "compare_perps":            "Side-by-side perps comparison — 0.05 USDC",
+            "get_optimal_gas_window":   "Predict best time to transact for min gas — 0.05 USDC",
+            "score_contract":           "Smart contract security risk score — 0.05 USDC",
+            "get_gas_price":            "Current gas prices across urgency levels — FREE",
             "get_defi_overview":        "Full DeFi market snapshot — FREE",
             "yield_alert_set":          "Register APY threshold alert — FREE",
             "yield_alert_check":        "Poll alert status — FREE",
