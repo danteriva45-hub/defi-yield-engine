@@ -579,6 +579,26 @@ async def well_known_x402(request: Request) -> JSONResponse:
 # Stockage alertes en mémoire
 _ALERTS: dict = {}
 
+_ALERTS_TTL = 2_592_000  # 30 days
+
+def _cleanup_expired_alerts() -> int:
+    """Remove alerts older than _ALERTS_TTL. Returns count removed."""
+    now = time.time()
+    expired = [aid for aid, a in _ALERTS.items() if (now - a["created_at"]) > _ALERTS_TTL]
+    for aid in expired:
+        del _ALERTS[aid]
+    if expired:
+        log.info(f"Cleaned up {len(expired)} expired alerts")
+    return len(expired)
+
+def _cleanup_all_alerts() -> int:
+    """STARTUP: Clear ALL accumulated alerts immediately on server start."""
+    count = len(_ALERTS)
+    if count > 0:
+        _ALERTS.clear()
+        log.warning(f"🧹 STARTUP: Cleared {count} stale alerts (freed ~{count * 150 / 1024:.1f} KB)")
+    return count
+
 
 @mcp.tool
 async def yield_alert_set(
@@ -605,6 +625,8 @@ async def yield_alert_set(
     Returns:
         JSON with alert_id, current status (triggered/watching), current best APY.
     """
+    _cleanup_expired_alerts()
+
     import uuid
     alert_id = str(uuid.uuid4())[:8]
     current = await get_best_yield(asset, 1_000, risk_profile, chain)
@@ -623,6 +645,7 @@ async def yield_alert_set(
         "status": "triggered" if already_triggered else "watching",
         "asset": asset, "threshold_apy": threshold_apy,
         "current_best_apy": current_apy, "price": "free",
+        "active_alerts": len(_ALERTS), "ttl_seconds": _ALERTS_TTL,
         "message": (
             f"TRIGGERED: {asset} yield {current_apy}% > {threshold_apy}%"
             if already_triggered else
@@ -646,6 +669,8 @@ async def yield_alert_check(
     Returns:
         JSON with status, current_best_apy, threshold, recommendation if triggered.
     """
+    _cleanup_expired_alerts()
+
     if alert_id not in _ALERTS:
         return {"status": "not_found", "alert_id": alert_id,
                 "message": "Alert not found — may have expired on server restart."}
@@ -661,6 +686,7 @@ async def yield_alert_check(
         "asset": alert["asset"], "threshold_apy": alert["threshold_apy"],
         "current_best_apy": current_apy, "risk_profile": alert["risk_profile"],
         "age_seconds": int(time.time()) - alert["created_at"], "price": "free",
+        "active_alerts": len(_ALERTS), "ttl_seconds": _ALERTS_TTL,
     }
     if triggered:
         result["recommendation"] = current.get("recommendation", {})
@@ -696,8 +722,10 @@ async def yield_alerts_list() -> dict:
     Returns:
         JSON with all alerts, their status, and age in seconds.
     """
+    _cleanup_expired_alerts()
+
     if not _ALERTS:
-        return {"alerts": [], "count": 0}
+        return {"alerts": [], "count": 0, "active_alerts": len(_ALERTS), "ttl_seconds": _ALERTS_TTL}
     return {
         "alerts": [
             {"alert_id": aid, "asset": a["asset"],
@@ -707,6 +735,7 @@ async def yield_alerts_list() -> dict:
             for aid, a in _ALERTS.items()
         ],
         "count": len(_ALERTS), "price": "free",
+        "active_alerts": len(_ALERTS), "ttl_seconds": _ALERTS_TTL,
     }
 
 
@@ -2119,6 +2148,8 @@ if __name__ == "__main__":
     import os
     port = int(os.getenv("PORT", 8000))
     transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+
+    _cleanup_all_alerts()
 
     log.info(f"Starting DeFi Yield Engine on port {port} ({transport})")
     log.info(f"x402 recipient  : {X402_RECIPIENT}")
